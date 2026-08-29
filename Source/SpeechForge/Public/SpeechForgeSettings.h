@@ -10,13 +10,11 @@
 class USpeechVoice;
 
 /**
- * Everything the pipeline needs that is not per-line, including signing in to a provider.
+ * Everything the pipeline needs that is not per-line, and that the whole team shares.
  *
- * The API key field below is deliberately unlike the rest of this class. It carries no `config`
- * specifier and is `Transient`, so it is never written to an ini; typing into it hands the value
- * straight to the OS credential vault and blanks the field again. What persists is the vault entry,
- * which lives outside the project directory and therefore cannot be copied, committed or zipped along
- * with the project.
+ * Signing in is not one of those things — a key is one person's, on one machine, so it lives in
+ * Editor Preferences ▸ Automation Forge ▸ SpeechForge and in the OS credential vault.
+ * See USpeechForgeEditorSettings.
  */
 UCLASS(config = Editor, defaultconfig, meta = (DisplayName = "SpeechForge"))
 class SPEECHFORGE_API USpeechForgeSettings : public UDeveloperSettings
@@ -33,47 +31,8 @@ public:
 	static const USpeechForgeSettings* Get();
 
 #if WITH_EDITOR
-	virtual void PostInitProperties() override;
 	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
 #endif
-
-	// ---------------------------------------------------------------------------------------------
-	// Credentials
-	// ---------------------------------------------------------------------------------------------
-
-	/** Which provider the fields below act on. */
-	UPROPERTY(Transient, EditAnywhere, Category = "Credentials")
-	FName CredentialProviderId = TEXT("ElevenLabs");
-
-	/**
-	 * Paste an API key here to sign in.
-	 *
-	 * Stored in the OS credential vault the moment you commit the field, which is then cleared. The
-	 * value is never saved to a config file and cannot be read back out through this panel.
-	 */
-	UPROPERTY(Transient, EditAnywhere, Category = "Credentials",
-		meta = (PasswordField = true, DisplayName = "API Key"))
-	FString ApiKeyEntry;
-
-	/**
-	 * Whether a key is available, and where it is coming from.
-	 *
-	 * Acting on it happens from the console, not from here:
-	 *   SpeechForge.TestConnection      one cheap authenticated call, result under LogSpeechForge
-	 *   SpeechForge.CredentialStatus    re-read this line, e.g. after setting an environment variable
-	 *   SpeechForge.ClearKey            forget the stored key
-	 *
-	 * There are no buttons because there cannot be. UFUNCTION(CallInEditor) does not render on a
-	 * UDeveloperSettings page - the details customization discards archetype objects before drawing
-	 * them and a settings panel edits the CDO, which is one. Adding real buttons here needs an
-	 * IDetailCustomization; until then the console is the honest surface rather than a control that
-	 * silently does nothing.
-	 */
-	UPROPERTY(Transient, VisibleAnywhere, Category = "Credentials", meta = (DisplayName = "Status"))
-	FString CredentialStatus;
-
-	/** Re-read CredentialStatus. Called on load and whenever the fields above change. */
-	void RefreshStatus();
 
 	// ---------------------------------------------------------------------------------------------
 	// Provider

@@ -61,6 +61,7 @@ public:
 	virtual FString BuildRequestText(const FString& Text, const FString& Direction) const override;
 
 	virtual FString GetCredentialServiceName() const override { return TEXT("ElevenLabs"); }
+	virtual FString GetCredentialHelpUrl() const override { return TEXT("https://elevenlabs.io/app/settings/api-keys"); }
 	virtual bool HasCredential() const override;
 
 	virtual void Synthesize(const FSpeechSynthesisRequest& Request, FOnSpeechSynthesized OnComplete) override;

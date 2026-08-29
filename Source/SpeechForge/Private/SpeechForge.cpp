@@ -1,8 +1,12 @@
 #include "SpeechForge.h"
 
+#if WITH_FORGE_KEYS
+#include "ForgeKeyRegistry.h"
+#endif
 #include "ISpeechProvider.h"
 #include "SpeechSources.h"
 #include "SpeechCredentialStore.h"
+#include "SpeechForgeEditorSettings.h"
 #include "SpeechForgeSettings.h"
 #include "HAL/IConsoleManager.h"
 
@@ -51,10 +55,8 @@ namespace SpeechForgeConsole
 				UE_LOG(LogSpeechForge, Log, TEXT("%s: %s"), *Id.ToString(), *FSpeechCredentialStore::DescribeSource(Service));
 			}
 
-			if (const USpeechForgeSettings* Settings = USpeechForgeSettings::Get())
-			{
-				const_cast<USpeechForgeSettings*>(Settings)->RefreshStatus();
-			}
+			// Keep the Editor Preferences page in step, since the console just changed what it reports.
+			USpeechForgeEditorSettings::Get()->RefreshStatus();
 		}));
 
 	static FAutoConsoleCommand CmdTestConnection(
@@ -126,10 +128,8 @@ namespace SpeechForgeConsole
 				UE_LOG(LogSpeechForge, Log, TEXT("There was no stored key for '%s' to clear."), *Service);
 			}
 
-			if (const USpeechForgeSettings* Settings = USpeechForgeSettings::Get())
-			{
-				const_cast<USpeechForgeSettings*>(Settings)->RefreshStatus();
-			}
+			// Keep the Editor Preferences page in step, since the console just changed what it reports.
+			USpeechForgeEditorSettings::Get()->RefreshStatus();
 		}));
 }
 
@@ -170,6 +170,50 @@ void FSpeechForgeModule::RegisterProvider(TSharedRef<ISpeechProvider> Provider)
 	Providers.Add(Id, Provider);
 	UE_LOG(LogSpeechForge, Log, TEXT("Registered speech provider '%s'."), *Id.ToString());
 
+	// Offer this provider's key to the shared Keys page — if ForgeKeys happens to be installed.
+	// SpeechForge does not link it and does not require it; without it this is a null check and the
+	// key is still set on SpeechForge's own settings page.
+#if WITH_FORGE_KEYS
+	if (IForgeKeysModule* Keys = IForgeKeysModule::GetOrLoad())
+	{
+		const FString Service = Provider->GetCredentialServiceName();
+		const FString Display = Provider->GetDisplayName();
+
+		FForgeKeyProvider Key;
+		Key.Id = FName(*FString::Printf(TEXT("SpeechForge.%s"), *Id.ToString()));
+		Key.DisplayName = FText::FromString(Display);
+		Key.Owner = LOCTEXT("SpeechForgeOwner", "SpeechForge");
+		Key.Purpose = FText::Format(
+			LOCTEXT("SpeechKeyPurpose", "Voice generation through {0}. Your own account — we never resell speech."),
+			FText::FromString(Display));
+		Key.HelpUrl = Provider->GetCredentialHelpUrl();
+		Key.VaultEntryName = FString::Printf(TEXT("SpeechForge/%s"), *Service);
+		Key.EnvironmentVariableName = FSpeechCredentialStore::GetEnvironmentVariableName(Service);
+
+		Key.IsSet    = [Service]() { return FSpeechCredentialStore::Has(Service); };
+		Key.Describe = [Service]() { return FSpeechCredentialStore::DescribeSource(Service); };
+		Key.Store    = [Service](const FString& Secret) { return FSpeechCredentialStore::Set(Service, Secret); };
+		Key.Clear    = [Service]() { return FSpeechCredentialStore::Remove(Service); };
+
+		TWeakPtr<ISpeechProvider> WeakProvider = Provider.ToSharedPtr();
+		Key.Test = [WeakProvider](FForgeKeyTestResult Done)
+		{
+			if (TSharedPtr<ISpeechProvider> Pinned = WeakProvider.Pin())
+			{
+				Pinned->TestConnection([Done](bool bSuccess, const FString& Message)
+				{
+					Done(bSuccess, FText::FromString(Message));
+				});
+			}
+			else
+			{
+				Done(false, LOCTEXT("SpeechProviderGone", "That provider is no longer loaded."));
+			}
+		};
+		Keys->Registry().Register(MoveTemp(Key));
+	}
+#endif
+
 	OnProvidersChanged.Broadcast();
 }
 
@@ -178,6 +222,12 @@ void FSpeechForgeModule::UnregisterProvider(FName ProviderId)
 	if (Providers.Remove(ProviderId) > 0)
 	{
 		UE_LOG(LogSpeechForge, Log, TEXT("Unregistered speech provider '%s'."), *ProviderId.ToString());
+#if WITH_FORGE_KEYS
+		if (IForgeKeysModule* Keys = IForgeKeysModule::GetIfLoaded())
+		{
+			Keys->Registry().Unregister(FName(*FString::Printf(TEXT("SpeechForge.%s"), *ProviderId.ToString())));
+		}
+#endif
 		OnProvidersChanged.Broadcast();
 	}
 }

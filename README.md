@@ -283,6 +283,21 @@ SpeechForge.ClearKey             forget the stored key
 
 ---
 
+## Keys, and the machine they live on
+
+`Config/ForgeMachine.json` declares the API keys this plugin wants: what each one
+is for, where to get one, the Windows Credential Manager entry it lives in, and
+the environment variable consulted when the vault has nothing.
+
+Two surfaces read it. The editor's Keys page — **Tools ▸ Automation Forge ▸
+Keys** — and the Automation Forge hub, which is a separate application and can
+therefore set a key before an editor is open. They address the same vault entry,
+so a key set in either is set for both, for every project on the machine.
+
+The plugin's own settings page still sets the same key, and works with neither of
+the other two installed. That is the point of the declaration being data: nothing
+here depends on anything else being present.
+
 ## Related
 
 - **[SpeechForgeToolset](../SpeechForgeToolset/README.md)** — the same pipeline as MCP tools, plus

@@ -116,78 +116,13 @@ FString USpeechForgeSettings::GetAbsoluteStagingDirectory() const
 	return Absolute;
 }
 
-void USpeechForgeSettings::RefreshStatus()
-{
-	// Resolve the service name through the provider rather than assuming it equals the provider id.
-	// A provider is free to share a vault entry with something else, and the panel should report what
-	// is actually read rather than what would be read if it did not.
-	FString Service = CredentialProviderId.ToString();
-
-	if (FSpeechForgeModule* Module = FSpeechForgeModule::GetPtrIfLoaded())
-	{
-		if (TSharedPtr<ISpeechProvider> Provider = Module->FindProvider(CredentialProviderId))
-		{
-			Service = Provider->GetCredentialServiceName();
-		}
-		else if (Module->GetProviderIds().Num() == 0)
-		{
-			CredentialStatus = TEXT("No providers are registered. Enable a provider plugin first.");
-			return;
-		}
-	}
-
-	CredentialStatus = FSpeechCredentialStore::DescribeSource(Service);
-}
-
 #if WITH_EDITOR
-
-void USpeechForgeSettings::PostInitProperties()
-{
-	Super::PostInitProperties();
-
-	if (!HasAnyFlags(RF_ClassDefaultObject) || GetClass()->GetDefaultObject() == this)
-	{
-		RefreshStatus();
-	}
-}
 
 void USpeechForgeSettings::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
 	Super::PostEditChangeProperty(PropertyChangedEvent);
 
 	const FName PropertyName = PropertyChangedEvent.GetPropertyName();
-
-	if (PropertyName == GET_MEMBER_NAME_CHECKED(USpeechForgeSettings, ApiKeyEntry))
-	{
-		if (!ApiKeyEntry.IsEmpty())
-		{
-			FString Service = CredentialProviderId.ToString();
-
-			if (FSpeechForgeModule* Module = FSpeechForgeModule::GetPtrIfLoaded())
-			{
-				if (TSharedPtr<ISpeechProvider> Provider = Module->FindProvider(CredentialProviderId))
-				{
-					Service = Provider->GetCredentialServiceName();
-				}
-			}
-
-			FSpeechCredentialStore::Set(Service, ApiKeyEntry);
-
-			// Blanked immediately. The field is Transient and carries no config specifier, so it was
-			// never going to reach an ini - but leaving the value sitting in a details panel is still
-			// a way for it to end up in a screenshot.
-			ApiKeyEntry.Reset();
-		}
-
-		RefreshStatus();
-		return;
-	}
-
-	if (PropertyName == GET_MEMBER_NAME_CHECKED(USpeechForgeSettings, CredentialProviderId))
-	{
-		RefreshStatus();
-		return;
-	}
 
 	if (PropertyName == GET_MEMBER_NAME_CHECKED(USpeechForgeSettings, RequestedSampleRate))
 	{

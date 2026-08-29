@@ -169,6 +169,12 @@ public:
 	/** True when a usable credential is available. */
 	virtual bool HasCredential() const = 0;
 
+	/**
+	 * Where a person signs up for a key, shown beside the field that asks for one.
+	 * Optional — a provider that needs no account leaves it empty.
+	 */
+	virtual FString GetCredentialHelpUrl() const { return FString(); }
+
 	/** Generate one line. This is the call that costs money, and it costs it immediately. */
 	virtual void Synthesize(const FSpeechSynthesisRequest& Request, FOnSpeechSynthesized OnComplete) = 0;
 
