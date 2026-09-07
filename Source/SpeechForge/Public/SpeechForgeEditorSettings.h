@@ -35,9 +35,9 @@ public:
 	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
 #endif
 
-	/** Which provider the fields below act on. */
+	/** Which provider the fields below act on. Empty means whichever provider is the default. */
 	UPROPERTY(Transient, EditAnywhere, Category = "Credentials")
-	FName CredentialProviderId = TEXT("ElevenLabs");
+	FName CredentialProviderId = NAME_None;
 
 	/**
 	 * Paste an API key here to sign in.

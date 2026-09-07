@@ -7,7 +7,7 @@
 #include "SpeechForgeTypes.h"
 #include "SpeechForgeSettings.generated.h"
 
-class USpeechVoice;
+class USpeechVoiceProfile;
 
 /**
  * Everything the pipeline needs that is not per-line, and that the whole team shares.
@@ -38,9 +38,16 @@ public:
 	// Provider
 	// ---------------------------------------------------------------------------------------------
 
-	/** Which provider new voices use when they do not name one. */
+	/**
+	 * Which provider new voices use when they do not name one.
+	 *
+	 * None on purpose: the core ships no provider, so it names none. Unset, the sole registered
+	 * provider is used - a machine with one provider plugin enabled has already made the choice -
+	 * and with several registered, generation asks for this to be set rather than guessing, because
+	 * providers bill different accounts. See FSpeechForgeModule::ResolveDefaultProviderId.
+	 */
 	UPROPERTY(config, EditAnywhere, Category = "Provider")
-	FName DefaultProviderId = TEXT("ElevenLabs");
+	FName DefaultProviderId = NAME_None;
 
 	/**
 	 * Model used when neither the line nor the voice names one.
@@ -52,9 +59,9 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Provider")
 	FString DefaultModelId = TEXT("eleven_v3");
 
-	/** Voice used when nothing else resolves one. Mostly useful while prototyping. */
+	/** Voice profile used when nothing else resolves one. Mostly useful while prototyping. */
 	UPROPERTY(config, EditAnywhere, Category = "Provider")
-	TSoftObjectPtr<USpeechVoice> DefaultVoice;
+	TSoftObjectPtr<USpeechVoiceProfile> DefaultVoice;
 
 	/**
 	 * What one thousand billed characters costs, for turning estimates into money.
@@ -64,6 +71,17 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Provider", meta = (ClampMin = 0.0, DisplayName = "Cost Per 1000 Characters"))
 	float CostPerThousandCharacters = 0.10f;
+
+	/**
+	 * What one minute of converted audio costs, for pricing speech to speech.
+	 *
+	 * A separate rate because it is a separate meter: a provider may charge per character to
+	 * synthesise and per second of audio to convert, so one number cannot answer both. Zero means
+	 * conversion estimates report duration only - the same honest default as the character rate,
+	 * and for the same reason: only the account knows the number.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Provider", meta = (ClampMin = 0.0, DisplayName = "Cost Per Minute Of Converted Audio"))
+	float CostPerMinuteOfAudio = 0.f;
 
 	/** Purely for display alongside an estimate. */
 	UPROPERTY(config, EditAnywhere, Category = "Provider")
@@ -98,9 +116,10 @@ public:
 	// after the second run - voices, banks and results in one list, with throwaway test fixtures
 	// indistinguishable from real content. Tidying that up by hand does not hold, because the next
 	// generation puts it all back; the sort has to live here, where the assets are created.
-	FString GetBanksPath()  const { return OutputContentPath / TEXT("Banks"); }
-	FString GetVoicesPath() const { return OutputContentPath / TEXT("Voices"); }
-	FString GetSoundsPath() const { return OutputContentPath / TEXT("Sounds"); }
+	FString GetBanksPath()    const { return OutputContentPath / TEXT("Banks"); }
+	FString GetVoicesPath()   const { return OutputContentPath / TEXT("Voices"); }
+	FString GetSpeakersPath() const { return OutputContentPath / TEXT("Speakers"); }
+	FString GetSoundsPath()   const { return OutputContentPath / TEXT("Sounds"); }
 
 	/** Every path above, resolved, as one value a caller can read or report. */
 	FSpeechOutputPaths GetOutputPaths() const;

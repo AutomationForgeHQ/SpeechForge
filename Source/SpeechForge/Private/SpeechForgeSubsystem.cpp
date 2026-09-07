@@ -6,13 +6,19 @@
 #include "SpeechSources.h"
 #include "SpeechBank.h"
 #include "SpeechLineDef.h"
-#include "SpeechVoice.h"
+#include "SpeechSpeaker.h"
+#include "SpeechVoiceProfile.h"
 #include "SpeechImporter.h"
+
+#include "AssetToolsModule.h"
+#include "AssetImportTask.h"
+#include "Factories/SoundFactory.h"
 #include "ISpeechProvider.h"
-#include "Providers/ElevenLabsProvider.h"
 
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Sound/SoundWave.h"
+#include "Framework/Docking/TabManager.h"
+#include "HAL/FileManager.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "UObject/SavePackage.h"
@@ -22,15 +28,51 @@ void USpeechForgeSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
 
-	// The first provider is registered by the capability plugin itself, exactly as MotionForge does
-	// with its own. Additional providers are separate plugins that register themselves and that this
-	// module never learns the names of.
-	if (FSpeechForgeModule* Module = FSpeechForgeModule::GetPtr())
+	// No provider is registered here, and that is the point. Every provider - ElevenLabs included,
+	// since its extraction into SpeechForgeElevenLabs - is a separate plugin that registers itself
+	// at module startup, and this subsystem never learns any of their names.
+
+	// The drift sweep waits for the registry's first scan to finish, because before that a query for
+	// every bank in the project answers with whatever has been discovered so far - which on a cold
+	// open is nothing, and reports a clean project by looking at none of it.
+	FAssetRegistryModule& AssetRegistryModule =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+
+	AssetRegistryModule.Get().OnFilesLoaded().AddUObject(this, &USpeechForgeSubsystem::ReportSourceDriftOnStartup);
+}
+
+void USpeechForgeSubsystem::ReportSourceDriftOnStartup()
+{
+	const TArray<FSpeechSourceDrift> Drifted = CheckSourceDrift();
+	if (Drifted.Num() == 0)
 	{
-		if (!Module->FindProvider(FElevenLabsProvider::ProviderId).IsValid())
+		return;
+	}
+
+	// Warning, not Log. This is the class of problem that ships: the subtitle, the voice and the
+	// script disagreeing with nobody having touched the bank that connects them.
+	UE_LOG(LogSpeechForge, Warning,
+		TEXT("%d speech bank(s) were harvested from a script that has changed since. Re-harvest to ")
+		TEXT("see what moved - lines with audio may now disagree with their subtitles."),
+		Drifted.Num());
+
+	for (const FSpeechSourceDrift& Report : Drifted)
+	{
+		if (Report.SourceWrittenAt == FDateTime())
 		{
-			Module->RegisterProvider(MakeShared<FElevenLabsProvider>());
+			UE_LOG(LogSpeechForge, Warning,
+				TEXT("  %s: its source '%s' no longer exists, so it can never be re-harvested."),
+				*Report.BankPath, *Report.SourceAssetPath);
+			continue;
 		}
+
+		UE_LOG(LogSpeechForge, Warning,
+			TEXT("  %s: '%s' written %s, harvested %s. %d line(s) carry audio."),
+			*Report.BankPath,
+			*Report.SourceAssetPath,
+			*Report.SourceWrittenAt.ToString(),
+			*Report.HarvestedAt.ToString(),
+			Report.LinesWithAudio);
 	}
 }
 
@@ -55,8 +97,7 @@ TSharedPtr<ISpeechProvider> USpeechForgeSubsystem::FindProvider(FName ProviderId
 
 	if (ProviderId.IsNone())
 	{
-		const USpeechForgeSettings* Settings = USpeechForgeSettings::Get();
-		ProviderId = Settings ? Settings->DefaultProviderId : NAME_None;
+		ProviderId = Module->ResolveDefaultProviderId();
 	}
 
 	return Module->FindProvider(ProviderId);
@@ -191,6 +232,101 @@ TArray<FString> USpeechForgeSubsystem::FindSpeechAssets() const
 	return Paths;
 }
 
+FString USpeechForgeSubsystem::ApplyRecordedAudio(
+	const FString& AssetPath, FName LineId, const FString& AudioSource, FString& OutError)
+{
+	UObject* Asset = LoadSourceAsset(AssetPath);
+	ISpeechLineSource* Source = AsLineSource(Asset);
+	if (!Source)
+	{
+		OutError = FString::Printf(TEXT("No speech line source at '%s'."), *AssetPath);
+		return FString();
+	}
+
+	FSpeechLine* Line = Source->FindLineMutable(LineId);
+	if (!Line)
+	{
+		OutError = FString::Printf(TEXT("'%s' has no line '%s'."), *AssetPath, *LineId.ToString());
+		return FString();
+	}
+
+	USoundWave* Applied = nullptr;
+	FString ImportedFileHash;
+
+	if (AudioSource.StartsWith(TEXT("/")))
+	{
+		Applied = LoadObject<USoundWave>(nullptr, *AudioSource);
+		if (!Applied)
+		{
+			OutError = FString::Printf(TEXT("No sound wave at '%s'."), *AudioSource);
+			return FString();
+		}
+	}
+	else
+	{
+		const USpeechForgeSettings* Settings = USpeechForgeSettings::Get();
+
+		FAssetToolsModule& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
+
+		UAssetImportTask* Task = NewObject<UAssetImportTask>();
+		Task->Filename = AudioSource;
+		Task->DestinationPath = Settings ? Settings->GetSoundsPath() : TEXT("/Game/_Generated/Speech/Sounds");
+		Task->DestinationName = FSpeechImporter::SanitizeAssetName(
+			FString::Printf(TEXT("SW_Recorded_%s"), *LineId.ToString()));
+		Task->bAutomated = true;
+		Task->bReplaceExisting = true;
+		Task->bSave = true;
+
+		USoundFactory* Factory = NewObject<USoundFactory>();
+		Factory->bAutoCreateCue = false;
+		Task->Factory = Factory;
+
+		AssetTools.Get().ImportAssetTasks({ Task });
+
+		for (UObject* Object : Task->GetObjects())
+		{
+			if ((Applied = Cast<USoundWave>(Object)) != nullptr)
+			{
+				break;
+			}
+		}
+
+		if (!Applied)
+		{
+			OutError = FString::Printf(TEXT("'%s' did not import as a sound wave."), *AudioSource);
+			return FString();
+		}
+
+		ImportedFileHash = FSpeechImporter::HashFile(AudioSource);
+	}
+
+	// The graduation itself. Sound moves; GeneratedSound does not - a generated line's GeneratedSound
+	// already holds the generated take, and where it is empty (a line that was only ever recorded)
+	// there is nothing to preserve.
+	Line->Sound = Applied;
+	Line->Origin = ESpeechLineOrigin::Recorded;
+	Line->ImportedAudioHash = ImportedFileHash;
+
+	// The words the actor performed. Without this a line recorded before it was ever generated has
+	// no baseline at all, so rewriting its subtitle afterwards is completely silent - which is the
+	// worst version of this failure, because a recorded line is the one nothing can quietly fix.
+	Line->SpokenTextHash = FSpeechLine::ComputeSpokenTextHash(Line->Text);
+	Line->AudioCheckedAt = FDateTime::UtcNow();
+	if (Line->Status == ESpeechLineStatus::Draft || Line->Status == ESpeechLineStatus::Failed)
+	{
+		Line->Status = ESpeechLineStatus::Generated;
+	}
+	Line->LastError.Reset();
+
+	Asset->MarkPackageDirty();
+	SaveAsset(Asset);
+
+	UE_LOG(LogSpeechForge, Log, TEXT("Line '%s' now plays the recorded performance: %s (origin Recorded)."),
+		*LineId.ToString(), *Applied->GetPathName());
+
+	return Applied->GetPathName();
+}
+
 void USpeechForgeSubsystem::SaveAsset(UObject* Asset)
 {
 	if (!Asset)
@@ -212,6 +348,14 @@ void USpeechForgeSubsystem::SaveAsset(UObject* Asset)
 	SaveArgs.SaveFlags = SAVE_NoError;
 
 	UPackage::SavePackage(Package, nullptr, *Filename, SaveArgs);
+
+	// Every mutation in this subsystem lands here, which makes it the one honest place to say that
+	// something changed. Anything drawing these lines can then re-read rather than trust what it
+	// drew last. Static, so the announcement goes through the live subsystem.
+	if (USpeechForgeSubsystem* Live = USpeechForgeSubsystem::Get())
+	{
+		Live->OnLibraryChanged.Broadcast();
+	}
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -284,10 +428,11 @@ FString USpeechForgeSubsystem::CreateOrUpdateBank(
 	return Bank->GetPathName();
 }
 
-FString USpeechForgeSubsystem::CreateVoice(
+FString USpeechForgeSubsystem::CreateVoiceProfile(
 	const FString& AssetPath,
-	FName SpeakerId,
+	const FString& DisplayName,
 	const FString& ProviderVoiceId,
+	const FString& ProviderVoiceName,
 	FName ProviderId,
 	const FString& ModelId,
 	ESpeechVoiceProvenance Provenance)
@@ -303,7 +448,9 @@ FString USpeechForgeSubsystem::CreateVoice(
 
 	if (PackageName.IsEmpty())
 	{
-		ObjectName = FSpeechImporter::SanitizeAssetName(FString::Printf(TEXT("SV_%s"), *SpeakerId.ToString()));
+		const FString BaseName = !DisplayName.IsEmpty() ? DisplayName
+			: (!ProviderVoiceName.IsEmpty() ? ProviderVoiceName : ProviderVoiceId);
+		ObjectName = FSpeechImporter::SanitizeAssetName(FString::Printf(TEXT("VP_%s"), *BaseName));
 		PackageName = Settings->GetVoicesPath() / ObjectName;
 	}
 	else
@@ -312,9 +459,10 @@ FString USpeechForgeSubsystem::CreateVoice(
 		ObjectName = FPackageName::GetShortName(PackageName);
 	}
 
-	USpeechVoice* Voice = LoadObject<USpeechVoice>(nullptr, *(PackageName + TEXT(".") + ObjectName));
+	USpeechVoiceProfile* Profile =
+		LoadObject<USpeechVoiceProfile>(nullptr, *(PackageName + TEXT(".") + ObjectName));
 
-	if (!Voice)
+	if (!Profile)
 	{
 		UPackage* Package = CreatePackage(*PackageName);
 		if (!Package)
@@ -322,35 +470,451 @@ FString USpeechForgeSubsystem::CreateVoice(
 			return FString();
 		}
 
-		Voice = NewObject<USpeechVoice>(Package, *ObjectName, RF_Public | RF_Standalone);
+		Profile = NewObject<USpeechVoiceProfile>(Package, *ObjectName, RF_Public | RF_Standalone);
+		Profile->CreatedAt = FDateTime::UtcNow();
 
 		FAssetRegistryModule& AssetRegistry =
 			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
-		AssetRegistry.Get().AssetCreated(Voice);
+		AssetRegistry.Get().AssetCreated(Profile);
 	}
 
-	Voice->SpeakerId = SpeakerId;
-	Voice->ProviderVoiceId = ProviderVoiceId;
-	Voice->ProviderId = ProviderId.IsNone() ? Settings->DefaultProviderId : ProviderId;
-	Voice->ModelId = ModelId;
-	Voice->Provenance = Provenance;
-	Voice->PairedAt = FDateTime::UtcNow();
+	if (!DisplayName.IsEmpty())
+	{
+		Profile->DisplayName = DisplayName;
+	}
+	if (!ProviderVoiceName.IsEmpty())
+	{
+		Profile->ProviderVoiceName = ProviderVoiceName;
+	}
+	Profile->ProviderVoiceId = ProviderVoiceId;
+	Profile->ProviderId = !ProviderId.IsNone() ? ProviderId
+		: (FSpeechForgeModule::GetPtr() ? FSpeechForgeModule::GetPtr()->ResolveDefaultProviderId() : NAME_None);
+	Profile->ModelId = ModelId;
+	Profile->Provenance = Provenance;
 
-	Voice->MarkPackageDirty();
-	SaveAsset(Voice);
+	Profile->MarkPackageDirty();
+	SaveAsset(Profile);
 
 	if (Provenance == ESpeechVoiceProvenance::Premade)
 	{
 		// Said once, loudly, at the moment it can still be acted on cheaply. A stock voice can be
 		// retired by its provider and takes every line generated against it when it goes.
 		UE_LOG(LogSpeechForge, Warning,
-			TEXT("'%s' is paired with a stock provider voice. Those can be retired by the provider, ")
+			TEXT("'%s' records a stock provider voice. Those can be retired by the provider, ")
 			TEXT("which would take every line generated against it. Design or clone a voice before ")
 			TEXT("building a library on this one."),
 			*ObjectName);
 	}
 
-	return Voice->GetPathName();
+	return Profile->GetPathName();
+}
+
+FString USpeechForgeSubsystem::CreateOrUpdateSpeaker(
+	FName SpeakerId,
+	const FString& DisplayName,
+	const FString& Description,
+	const FString& VoiceProfilePath)
+{
+	const USpeechForgeSettings* Settings = USpeechForgeSettings::Get();
+	if (!Settings || SpeakerId.IsNone())
+	{
+		return FString();
+	}
+
+	USpeechSpeaker* Speaker = nullptr;
+
+	// The sheet is found by who it is, never by where it lives - a speaker seeded into one folder
+	// and later moved must still be the same speaker.
+	const FString Existing = FindSpeakerAssetPath(SpeakerId);
+	if (!Existing.IsEmpty())
+	{
+		Speaker = LoadObject<USpeechSpeaker>(nullptr, *Existing);
+	}
+
+	if (!Speaker)
+	{
+		const FString ObjectName =
+			FSpeechImporter::SanitizeAssetName(FString::Printf(TEXT("SP_%s"), *SpeakerId.ToString()));
+		const FString PackageName = Settings->GetSpeakersPath() / ObjectName;
+
+		UPackage* Package = CreatePackage(*PackageName);
+		if (!Package)
+		{
+			return FString();
+		}
+
+		Speaker = NewObject<USpeechSpeaker>(Package, *ObjectName, RF_Public | RF_Standalone);
+		Speaker->SpeakerId = SpeakerId;
+
+		FAssetRegistryModule& AssetRegistry =
+			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+		AssetRegistry.Get().AssetCreated(Speaker);
+	}
+
+	// Empty leaves alone, so a harvest that knows only identity never clobbers a cast voice.
+	if (!DisplayName.IsEmpty())
+	{
+		Speaker->DisplayName = DisplayName;
+	}
+	if (!Description.IsEmpty())
+	{
+		Speaker->Description = Description;
+	}
+	if (!VoiceProfilePath.IsEmpty())
+	{
+		Speaker->VoiceProfile = TSoftObjectPtr<USpeechVoiceProfile>(FSoftObjectPath(VoiceProfilePath));
+	}
+
+	Speaker->MarkPackageDirty();
+	SaveAsset(Speaker);
+
+	return Speaker->GetPathName();
+}
+
+bool USpeechForgeSubsystem::SetSpeakerBinding(FName SpeakerId, FName BindingKey, const FString& ObjectPath)
+{
+	if (SpeakerId.IsNone() || BindingKey.IsNone())
+	{
+		return false;
+	}
+
+	FString SpeakerPath = FindSpeakerAssetPath(SpeakerId);
+	if (SpeakerPath.IsEmpty())
+	{
+		SpeakerPath = CreateOrUpdateSpeaker(SpeakerId, FString(), FString(), FString());
+	}
+
+	USpeechSpeaker* Speaker = LoadObject<USpeechSpeaker>(nullptr, *SpeakerPath);
+	if (!Speaker)
+	{
+		return false;
+	}
+
+	Speaker->ExternalBindings.Add(BindingKey, FSoftObjectPath(ObjectPath));
+	Speaker->MarkPackageDirty();
+	SaveAsset(Speaker);
+	return true;
+}
+
+FString USpeechForgeSubsystem::FindSpeakerAssetPath(FName SpeakerId) const
+{
+	if (SpeakerId.IsNone())
+	{
+		return FString();
+	}
+
+	FAssetRegistryModule& AssetRegistry =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+
+	TArray<FAssetData> Assets;
+	AssetRegistry.Get().GetAssetsByClass(USpeechSpeaker::StaticClass()->GetClassPathName(), Assets, true);
+
+	for (const FAssetData& Data : Assets)
+	{
+		FString Tagged;
+		if (Data.GetTagValue(GET_MEMBER_NAME_CHECKED(USpeechSpeaker, SpeakerId), Tagged)
+			&& FName(*Tagged) == SpeakerId)
+		{
+			return Data.GetObjectPathString();
+		}
+	}
+
+	return FString();
+}
+
+TArray<FString> USpeechForgeSubsystem::FindSpeakerAssets() const
+{
+	FAssetRegistryModule& AssetRegistry =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+
+	TArray<FAssetData> Assets;
+	AssetRegistry.Get().GetAssetsByClass(USpeechSpeaker::StaticClass()->GetClassPathName(), Assets, true);
+
+	TArray<FString> Paths;
+	for (const FAssetData& Data : Assets)
+	{
+		Paths.Add(Data.GetObjectPathString());
+	}
+	Paths.Sort();
+	return Paths;
+}
+
+TArray<FString> USpeechForgeSubsystem::FindVoiceProfiles() const
+{
+	FAssetRegistryModule& AssetRegistry =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+
+	TArray<FAssetData> Assets;
+	AssetRegistry.Get().GetAssetsByClass(USpeechVoiceProfile::StaticClass()->GetClassPathName(), Assets, true);
+
+	TArray<FString> Paths;
+	for (const FAssetData& Data : Assets)
+	{
+		Paths.Add(Data.GetObjectPathString());
+	}
+	Paths.Sort();
+	return Paths;
+}
+
+FString USpeechForgeSubsystem::FindVoiceProfileByProviderVoice(
+	FName ProviderId, const FString& ProviderVoiceId) const
+{
+	if (ProviderVoiceId.IsEmpty())
+	{
+		return FString();
+	}
+
+	// Loads the profiles to compare - acceptable because a project holds tens of profiles, not
+	// thousands, and this runs on a click, not per frame.
+	for (const FString& Path : FindVoiceProfiles())
+	{
+		const USpeechVoiceProfile* Profile = LoadObject<USpeechVoiceProfile>(nullptr, *Path);
+		if (Profile
+			&& Profile->ProviderVoiceId == ProviderVoiceId
+			&& (ProviderId.IsNone() || Profile->ProviderId.IsNone() || Profile->ProviderId == ProviderId))
+		{
+			return Path;
+		}
+	}
+	return FString();
+}
+
+namespace
+{
+	/** When a content asset's package was last written, or MinValue when there is no such file. */
+	FDateTime PackageWriteTime(const FString& ObjectPath)
+	{
+		if (ObjectPath.IsEmpty())
+		{
+			return FDateTime::MinValue();
+		}
+
+		// "/Game/X/DLG_A.DLG_A" and "/Game/X/DLG_A" both have to work: callers hold whichever form
+		// their adapter happened to store.
+		FString PackageName = ObjectPath;
+		int32 Dot = INDEX_NONE;
+		if (PackageName.FindChar(TEXT('.'), Dot))
+		{
+			PackageName.LeftInline(Dot);
+		}
+
+		FString Filename;
+		if (!FPackageName::DoesPackageExist(PackageName, &Filename))
+		{
+			return FDateTime::MinValue();
+		}
+
+		return IFileManager::Get().GetTimeStamp(*Filename);
+	}
+}
+
+bool USpeechForgeSubsystem::SetBankSource(
+	const FString& BankPath, FName SourceAdapter, const FString& SourceAssetPath,
+	const FString& SpeakerFilter)
+{
+	USpeechBank* Bank = LoadObject<USpeechBank>(nullptr, *BankPath);
+	if (!Bank)
+	{
+		return false;
+	}
+
+	// The source's own file time, not the wall clock. The drift sweep compares this against that
+	// same file later, and two clocks would make the comparison meaningless the first time a machine
+	// with a skewed time joined the project.
+	const FDateTime SourceTime = PackageWriteTime(SourceAssetPath);
+
+	if (Bank->SourceAdapter == SourceAdapter &&
+		Bank->SourceAssetPath == SourceAssetPath &&
+		Bank->SourceSpeakerFilter == SpeakerFilter &&
+		Bank->SourceHarvestedAt == SourceTime)
+	{
+		// Re-harvests land here every time; an unchanged stamp is not worth a dirty package.
+		return true;
+	}
+
+	Bank->SourceAdapter = SourceAdapter;
+	Bank->SourceAssetPath = SourceAssetPath;
+	Bank->SourceSpeakerFilter = SpeakerFilter;
+	Bank->SourceHarvestedAt = SourceTime;
+	Bank->MarkPackageDirty();
+	SaveAsset(Bank);
+	return true;
+}
+
+TMap<FName, FString> USpeechForgeSubsystem::FindLineHomes(
+	const TArray<FName>& LineIds, const FString& LanguageCode, const FString& IgnoreBankPath) const
+{
+	TMap<FName, FString> Homes;
+	if (LineIds.Num() == 0)
+	{
+		return Homes;
+	}
+
+	FString IgnorePackage = IgnoreBankPath;
+	IgnorePackage.Split(TEXT("."), &IgnorePackage, nullptr);
+
+	FAssetRegistryModule& AssetRegistry =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+
+	TArray<FAssetData> Banks;
+	AssetRegistry.Get().GetAssetsByClass(USpeechBank::StaticClass()->GetClassPathName(), Banks, true);
+
+	for (const FAssetData& Data : Banks)
+	{
+		if (!IgnorePackage.IsEmpty() && Data.PackageName.ToString() == IgnorePackage)
+		{
+			continue;
+		}
+
+		// Same language only: a localised sibling holding the same line id is a different line,
+		// which is the whole localisation model, not a duplicate home.
+		FString BankLanguage;
+		Data.GetTagValue(TEXT("LanguageCode"), BankLanguage);
+		if (BankLanguage != LanguageCode)
+		{
+			continue;
+		}
+
+		FString Index;
+		if (Data.GetTagValue(TEXT("LineIdIndex"), Index) && !Index.IsEmpty())
+		{
+			for (const FName LineId : LineIds)
+			{
+				if (!Homes.Contains(LineId) &&
+					Index.Contains(TEXT(";") + LineId.ToString() + TEXT(";")))
+				{
+					Homes.Add(LineId, Data.GetSoftObjectPath().ToString());
+				}
+			}
+			continue;
+		}
+
+		// Saved before the index existed: answered the slow way, once. Its next save stamps it.
+		if (const USpeechBank* Bank = Cast<USpeechBank>(Data.GetAsset()))
+		{
+			for (const FName LineId : LineIds)
+			{
+				if (!Homes.Contains(LineId) && Bank->FindLine(LineId))
+				{
+					Homes.Add(LineId, Bank->GetPathName());
+				}
+			}
+		}
+	}
+
+	return Homes;
+}
+
+int32 USpeechForgeSubsystem::RemoveBankLines(
+	const FString& BankPath, const TArray<FName>& LineIds, FString& OutError)
+{
+	// A bank only. A USpeechLineDef holds exactly one line - removing it leaves a husk that every
+	// tool would still count, so the honest way to remove that line is deleting the asset.
+	UObject* Asset = LoadSourceAsset(BankPath);
+	USpeechBank* Bank = Cast<USpeechBank>(Asset);
+	if (!Bank)
+	{
+		OutError = Asset
+			? TEXT("That is a single-line asset - delete the asset itself in the Content Browser.")
+			: FString::Printf(TEXT("No speech bank at '%s'."), *BankPath);
+		return 0;
+	}
+
+	const int32 Before = Bank->Lines.Num();
+	Bank->Lines.RemoveAll([&LineIds](const FSpeechLine& Line)
+	{
+		return LineIds.Contains(Line.LineId);
+	});
+
+	const int32 Removed = Before - Bank->Lines.Num();
+	if (Removed == 0)
+	{
+		// Nothing matched, nothing dirtied. Not an error: removing the already-removed is the
+		// idempotence a caller retrying a batch relies on.
+		return 0;
+	}
+
+	Bank->MarkPackageDirty();
+	SaveAsset(Bank);
+
+	UE_LOG(LogSpeechForge, Log, TEXT("Removed %d line(s) from '%s'; %d remain. Their audio assets stay."),
+		Removed, *BankPath, Bank->Lines.Num());
+
+	return Removed;
+}
+
+int32 USpeechForgeSubsystem::ClearBankLines(const FString& BankPath, FString& OutError)
+{
+	UObject* Asset = LoadSourceAsset(BankPath);
+	USpeechBank* Bank = Cast<USpeechBank>(Asset);
+	if (!Bank)
+	{
+		OutError = Asset
+			? TEXT("That is a single-line asset - delete the asset itself in the Content Browser.")
+			: FString::Printf(TEXT("No speech bank at '%s'."), *BankPath);
+		return 0;
+	}
+
+	const int32 Removed = Bank->Lines.Num();
+	if (Removed == 0)
+	{
+		return 0;
+	}
+
+	Bank->Lines.Empty();
+	Bank->MarkPackageDirty();
+	SaveAsset(Bank);
+
+	UE_LOG(LogSpeechForge, Log, TEXT("Cleared %d line(s) from '%s'. Their audio assets stay."),
+		Removed, *BankPath);
+
+	return Removed;
+}
+
+bool USpeechForgeSubsystem::UpdateLineAuthoring(
+	const FSpeechLineHandle& Handle,
+	const FString& Text,
+	const FString& Direction,
+	FName SpeakerId)
+{
+	UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+	ISpeechLineSource* Source = AsLineSource(Asset);
+	FSpeechLine* Line = Source ? Source->FindLineMutable(Handle.LineId) : nullptr;
+	if (!Line)
+	{
+		return false;
+	}
+
+	Line->Text = Text;
+	Line->Direction = Direction;
+	if (!SpeakerId.IsNone())
+	{
+		Line->SpeakerId = SpeakerId;
+	}
+
+	Asset->MarkPackageDirty();
+	SaveAsset(Asset);
+	return true;
+}
+
+bool USpeechForgeSubsystem::SetLineVoiceOverride(
+	const FSpeechLineHandle& Handle, const FString& VoiceProfilePath)
+{
+	UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+	ISpeechLineSource* Source = AsLineSource(Asset);
+	FSpeechLine* Line = Source ? Source->FindLineMutable(Handle.LineId) : nullptr;
+	if (!Line)
+	{
+		return false;
+	}
+
+	Line->VoiceOverride = VoiceProfilePath.IsEmpty()
+		? TSoftObjectPtr<USpeechVoiceProfile>()
+		: TSoftObjectPtr<USpeechVoiceProfile>(FSoftObjectPath(VoiceProfilePath));
+
+	Asset->MarkPackageDirty();
+	SaveAsset(Asset);
+	return true;
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -387,45 +951,40 @@ FSpeechVoiceResolution USpeechForgeSubsystem::ResolveVoice(const FSpeechLineHand
 		? Line->ModelOverride
 		: (!Defaults.ModelId.IsEmpty() ? Defaults.ModelId : Settings->DefaultModelId);
 
+	// Resolved through the module rather than read off the settings: with the setting unset this is
+	// the sole registered provider, and with several registered it is None - which every path below
+	// carries into the resolution, where generation refuses it with a message rather than guessing.
+	const FName FallbackProvider = FSpeechForgeModule::GetPtr()
+		? FSpeechForgeModule::GetPtr()->ResolveDefaultProviderId()
+		: NAME_None;
+
 	// 1. The line's own override. Explicit beats everything, so a single awkward line can always be
 	//    re-cast without disturbing anything else.
 	if (!Line->VoiceOverride.IsNull())
 	{
-		if (USpeechVoice* Voice = Line->VoiceOverride.LoadSynchronous())
+		if (USpeechVoiceProfile* Profile = Line->VoiceOverride.LoadSynchronous())
 		{
-			return Voice->MakeResolution(Settings->DefaultProviderId, FallbackModel,
-				FString::Printf(TEXT("line override -> %s"), *Voice->GetName()));
+			return Profile->MakeResolution(FallbackProvider, FallbackModel,
+				FString::Printf(TEXT("line override -> %s"), *Profile->GetLabel()));
 		}
 	}
 
-	// 2. Registered external sources, highest priority first. This is where an adapter plugin maps a
-	//    speaker onto a voice from wherever it likes, without SpeechForge knowing it exists.
-	if (FSpeechForgeModule* Module = FSpeechForgeModule::GetPtr())
+	// 2. The speaker's sheet. The cast list is the set of speaker assets - identity, voice and
+	//    external links consolidated in one place - so this is where "who speaks" becomes "in what
+	//    voice" for every line that has not been re-cast by hand.
+	if (!SpeakerId.IsNone())
 	{
-		FSpeechVoiceQuery Query;
-		Query.SpeakerId = SpeakerId;
-		Query.LineId = Line->LineId;
-		Query.SourceAssetPath = Handle.AssetPath;
-
-		for (const TSharedPtr<ISpeechVoiceSource>& VoiceSource : Module->GetVoiceSources())
+		const FString SpeakerPath = FindSpeakerAssetPath(SpeakerId);
+		if (!SpeakerPath.IsEmpty())
 		{
-			if (!VoiceSource.IsValid())
+			if (USpeechSpeaker* Speaker = LoadObject<USpeechSpeaker>(nullptr, *SpeakerPath))
 			{
-				continue;
-			}
-
-			FSpeechVoiceResolution FromSource;
-			if (VoiceSource->ResolveVoice(Query, FromSource) && FromSource.IsValid())
-			{
-				if (FromSource.ModelId.IsEmpty())
+				if (USpeechVoiceProfile* Profile = Speaker->VoiceProfile.LoadSynchronous())
 				{
-					FromSource.ModelId = FallbackModel;
+					return Profile->MakeResolution(FallbackProvider, FallbackModel,
+						FString::Printf(TEXT("speaker %s -> %s"),
+							*Speaker->GetLabel(), *Profile->GetLabel()));
 				}
-				if (FromSource.ProviderId.IsNone())
-				{
-					FromSource.ProviderId = Settings->DefaultProviderId;
-				}
-				return FromSource;
 			}
 		}
 	}
@@ -433,20 +992,20 @@ FSpeechVoiceResolution USpeechForgeSubsystem::ResolveVoice(const FSpeechLineHand
 	// 3. The container's default.
 	if (!Defaults.Voice.IsNull())
 	{
-		if (USpeechVoice* Voice = Defaults.Voice.LoadSynchronous())
+		if (USpeechVoiceProfile* Profile = Defaults.Voice.LoadSynchronous())
 		{
-			return Voice->MakeResolution(Settings->DefaultProviderId, FallbackModel,
-				FString::Printf(TEXT("asset default -> %s"), *Voice->GetName()));
+			return Profile->MakeResolution(FallbackProvider, FallbackModel,
+				FString::Printf(TEXT("asset default -> %s"), *Profile->GetLabel()));
 		}
 	}
 
 	// 4. The project default. Mostly useful while prototyping.
 	if (!Settings->DefaultVoice.IsNull())
 	{
-		if (USpeechVoice* Voice = Settings->DefaultVoice.LoadSynchronous())
+		if (USpeechVoiceProfile* Profile = Settings->DefaultVoice.LoadSynchronous())
 		{
-			return Voice->MakeResolution(Settings->DefaultProviderId, FallbackModel,
-				FString::Printf(TEXT("project default -> %s"), *Voice->GetName()));
+			return Profile->MakeResolution(FallbackProvider, FallbackModel,
+				FString::Printf(TEXT("project default -> %s"), *Profile->GetLabel()));
 		}
 	}
 
@@ -583,42 +1142,261 @@ TArray<FSpeechLineStatus> USpeechForgeSubsystem::GetLineStatus(const TArray<FSpe
 		Status.SoundPath = Line->Sound.IsNull() ? FString() : Line->Sound.ToString();
 		Status.ResolvedVoice = ResolveVoice(Handle);
 
-		// Staleness is computed, never stored. Storing it would mean invalidating every line whenever
-		// any voice asset anywhere changed, and getting that wrong is silent by construction.
-		if (Line->Status == ESpeechLineStatus::Generated && !Line->ContentHash.IsEmpty())
+		// Measured from what the line plays, like everything else here: a re-voicing is a take's
+		// variant, so the audio either is one or it is not. The legacy line-level conversion is
+		// caught by its source hash.
+		if (!Line->Sound.IsNull())
 		{
-			FSpeechSynthesisRequest Request;
-			FString Hash;
-			FString Error;
+			const FString LineSound = Line->Sound.ToString();
+			Status.bRevoiced = !Line->SourceAudioHash.IsEmpty();
 
-			if (BuildRequest(Handle, Request, Hash, Error) && Hash != Line->ContentHash)
+			for (const FSpeechLineTake& Take : Line->Takes)
 			{
-				Status.bStale = true;
-
-				const FString VoiceDiff = Status.ResolvedVoice.DescribeDifference(Line->GeneratedWith);
-				if (!VoiceDiff.IsEmpty())
+				for (const FSpeechTakeAudio& Variant : Take.Variants)
 				{
-					Status.StaleReason = VoiceDiff;
-				}
-				else
-				{
-					// Nothing about the voice moved, so it was the words. Worth distinguishing,
-					// because one is a re-record and the other is a re-read.
-					Status.StaleReason = TEXT("text or direction changed");
-				}
-
-				if (Line->Origin == ESpeechLineOrigin::Recorded)
-				{
-					// The report with money attached: a pickup session, scoped exactly.
-					Status.StaleReason += TEXT(" - line was RECORDED, so this needs a pickup, not a regeneration");
+					if (Variant.SoundPath == LineSound)
+					{
+						Status.bRevoiced = true;
+					}
 				}
 			}
 		}
+
+		// Staleness is computed, never stored. Storing it would mean invalidating every line whenever
+		// any voice asset anywhere changed, and getting that wrong is silent by construction.
+		//
+		// Two questions are asked here, and keeping them apart is the whole point. *Do the words
+		// still match the audio* applies to every line that has audio, however it arrived, and is
+		// the one that ships broken subtitles when it goes unasked. *Would re-running the operation
+		// produce something different* applies only to audio a tool made, and is the one with a
+		// button attached. They used to be a single hash, which is why a recorded line could have
+		// its script rewritten in silence.
+		TArray<FString> Reasons;
+
+		if (!Line->Sound.IsNull())
+		{
+			if (Line->SpokenTextHash.IsEmpty())
+			{
+				// Audio from before this baseline existed - but only genuinely unverifiable where
+				// nothing else can answer the question. A synthesised line still carries a content
+				// hash taken over its text, so a rewrite there is caught anyway; flagging those too
+				// would light up an entire existing library and teach everyone to ignore the flag.
+				// What is left is exactly the audio no text hash ever covered: recorded takes, and
+				// conversions, whose content hash deliberately holds no words at all.
+				const bool bTextCoveredByContentHash =
+					Line->Status == ESpeechLineStatus::Generated &&
+					!Line->ContentHash.IsEmpty() &&
+					Line->SourceAudioHash.IsEmpty();
+
+				Status.bWordsUnverified = !bTextCoveredByContentHash;
+			}
+			else if (FSpeechLine::ComputeSpokenTextHash(Line->Text) != Line->SpokenTextHash)
+			{
+				Status.bWordsDrifted = true;
+				Status.bStale = true;
+
+				const bool bPerformance =
+					Line->Origin == ESpeechLineOrigin::Recorded ||
+					Line->Origin == ESpeechLineOrigin::Edited;
+
+				Reasons.Add(bPerformance
+					? TEXT("THE SCRIPT CHANGED AFTER THIS WAS PERFORMED - the subtitle and the audio "
+					       "now say different things, and no regeneration can fix it: this needs a pickup")
+					: TEXT("the script changed after this audio was made - the subtitle and the voice "
+					       "now say different things"));
+			}
+		}
+
+		// The third question, and the only one whose answer lives in another asset: *is my source
+		// still the recording I was made from*. It is asked of dubs alone, because a dub is the one
+		// operation derived from another bank's line - and that line can be re-recorded, or have a
+		// different take chosen on it, long after this one was made. Nothing else on this line moves
+		// when that happens: its own audio, its own hashes and its own text are all exactly as they
+		// were, so without this it goes on playing a dub of a performance the scene has replaced.
+		//
+		// Cheap on purpose. The comparison is against a field the source line already maintains, so
+		// it costs a bank load and a string compare rather than a re-read of anybody's audio.
+		if (!Line->DubbedFromAudioHash.IsEmpty())
+		{
+			if (const USpeechBank* Bank = Cast<USpeechBank>(Asset))
+			{
+				if (!Bank->SourceBankPath.IsEmpty())
+				{
+					const USpeechBank* SourceBank =
+						LoadObject<USpeechBank>(nullptr, *Bank->SourceBankPath);
+					const FSpeechLine* SourceLine =
+						SourceBank ? SourceBank->FindLine(Handle.LineId) : nullptr;
+
+					// An empty hash on the source is not a mismatch - it is a source that has never
+					// been asked the question. Reporting that as a fault would flag every dub whose
+					// source predates audio hashing.
+					if (SourceLine && !SourceLine->ImportedAudioHash.IsEmpty() &&
+						SourceLine->ImportedAudioHash != Line->DubbedFromAudioHash)
+					{
+						Status.bStale = true;
+						Reasons.Add(
+							TEXT("the source language's recording changed after this was dubbed - "
+							     "this line still speaks the old performance; dub it again"));
+					}
+				}
+			}
+		}
+
+		if (Line->Status == ESpeechLineStatus::Generated && !Line->ContentHash.IsEmpty())
+		{
+			// A converted line is asked a different operation question. It never read the text, so
+			// hashing the text against it would report every re-voiced performance as permanently
+			// stale. What would make a *re-conversion* differ is the source or the voice - which is
+			// unrelated to whether the words still match, asked above and asked of every line.
+			if (!Line->SourceAudioHash.IsEmpty())
+			{
+				if (FSpeechLine::ComputeConversionHash(Line->SourceAudioHash, Status.ResolvedVoice)
+					!= Line->ContentHash)
+				{
+					Status.bStale = true;
+
+					const FString VoiceDiff = Status.ResolvedVoice.DescribeDifference(Line->GeneratedWith);
+					Reasons.Add(VoiceDiff.IsEmpty()
+						? TEXT("the source recording changed")
+						: VoiceDiff + TEXT(" - re-voice the performance from its source"));
+				}
+			}
+			else
+			{
+				FSpeechSynthesisRequest Request;
+				FString Hash;
+				FString Error;
+
+				if (BuildRequest(Handle, Request, Hash, Error) && Hash != Line->ContentHash)
+				{
+					Status.bStale = true;
+
+					const FString VoiceDiff = Status.ResolvedVoice.DescribeDifference(Line->GeneratedWith);
+					if (!VoiceDiff.IsEmpty())
+					{
+						Reasons.Add(VoiceDiff);
+					}
+					else if (!Status.bWordsDrifted)
+					{
+						// Nothing about the voice moved and the words are intact, so it was the
+						// direction - which changes the reading without changing what is said.
+						Reasons.Add(TEXT("direction changed"));
+					}
+
+					if (Line->Origin == ESpeechLineOrigin::Recorded && !Status.bWordsDrifted)
+					{
+						// The report with money attached: a pickup session, scoped exactly.
+						Reasons.Add(TEXT("line was RECORDED, so this needs a pickup, not a regeneration"));
+					}
+				}
+			}
+		}
+
+		Status.StaleReason = FString::Join(Reasons, TEXT(" | "));
 
 		Report.Add(MoveTemp(Status));
 	}
 
 	return Report;
+}
+
+void USpeechForgeSubsystem::OpenLibraryAt(const FString& BankPath, FName LineId)
+{
+	// The tab is invoked by name rather than by holding a widget: the panel may not exist yet, and
+	// whether it does is not this subsystem's business.
+	FGlobalTabmanager::Get()->TryInvokeTab(FName(TEXT("SpeechLibrary")));
+
+	// Broadcast after invoking, so a panel spawned by that call is already listening.
+	OnLibraryFocusRequested.Broadcast(BankPath, LineId);
+}
+
+FString USpeechForgeSubsystem::GetBankSourceDescription(const FString& BankPath) const
+{
+	const USpeechBank* Bank = LoadObject<USpeechBank>(nullptr, *BankPath);
+	if (!Bank || Bank->SourceAdapter.IsNone() || Bank->SourceAssetPath.IsEmpty())
+	{
+		return FString();
+	}
+
+	return FString::Printf(TEXT("%s|%s"), *Bank->SourceAdapter.ToString(), *Bank->SourceAssetPath);
+}
+
+TArray<FSpeechSourceDrift> USpeechForgeSubsystem::CheckSourceDrift() const
+{
+	TArray<FSpeechSourceDrift> Drifted;
+
+	const FAssetRegistryModule& AssetRegistryModule =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+	const IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
+
+	TArray<FAssetData> Banks;
+	AssetRegistry.GetAssetsByClass(USpeechBank::StaticClass()->GetClassPathName(), Banks);
+
+	for (const FAssetData& BankData : Banks)
+	{
+		// Read off the registry's cache first. A project's banks are mostly not adapter-sourced, and
+		// those are dismissed here without ever being loaded - which is what keeps a project-wide
+		// sweep cheap enough to run on startup without anybody noticing it happened.
+		FString SourcePath;
+		if (!BankData.GetTagValue(GET_MEMBER_NAME_CHECKED(USpeechBank, SourceAssetPath), SourcePath) ||
+			SourcePath.IsEmpty())
+		{
+			continue;
+		}
+
+		const FDateTime SourceTime = PackageWriteTime(SourcePath);
+		if (SourceTime == FDateTime::MinValue())
+		{
+			// The script this bank was harvested from is gone. Worth reporting rather than skipping:
+			// a bank whose source vanished cannot be re-harvested, and somebody should know that
+			// before they rely on the write-back button that is still on screen.
+			const USpeechBank* MissingSourceBank = Cast<USpeechBank>(BankData.GetAsset());
+			if (!MissingSourceBank)
+			{
+				continue;
+			}
+
+			FSpeechSourceDrift Report;
+			Report.BankPath = BankData.GetSoftObjectPath().ToString();
+			Report.SourceAssetPath = SourcePath;
+			Report.SourceAdapter = MissingSourceBank->SourceAdapter;
+			Report.HarvestedAt = MissingSourceBank->SourceHarvestedAt;
+			Drifted.Add(MoveTemp(Report));
+			continue;
+		}
+
+		const USpeechBank* Bank = Cast<USpeechBank>(BankData.GetAsset());
+		if (!Bank || Bank->SourceHarvestedAt == FDateTime())
+		{
+			// Never stamped - harvested before this baseline existed. Nothing to compare against, and
+			// inventing a comparison would either cry wolf over every bank or silence all of them.
+			continue;
+		}
+
+		if (SourceTime <= Bank->SourceHarvestedAt)
+		{
+			continue;
+		}
+
+		FSpeechSourceDrift Report;
+		Report.BankPath = BankData.GetSoftObjectPath().ToString();
+		Report.SourceAssetPath = SourcePath;
+		Report.SourceAdapter = Bank->SourceAdapter;
+		Report.HarvestedAt = Bank->SourceHarvestedAt;
+		Report.SourceWrittenAt = SourceTime;
+
+		for (const FSpeechLine& Line : Bank->Lines)
+		{
+			if (!Line.Sound.IsNull())
+			{
+				++Report.LinesWithAudio;
+			}
+		}
+
+		Drifted.Add(MoveTemp(Report));
+	}
+
+	return Drifted;
 }
 
 FSpeechCostEstimate USpeechForgeSubsystem::EstimateGenerationCost(
@@ -687,6 +1465,93 @@ FSpeechCostEstimate USpeechForgeSubsystem::EstimateGenerationCost(
 	{
 		Estimate.EstimatedCost =
 			(static_cast<float>(Estimate.BilledCharacters) / 1000.f) * Settings->CostPerThousandCharacters;
+	}
+
+	return Estimate;
+}
+
+FSpeechCostEstimate USpeechForgeSubsystem::EstimateConversionCost(
+	const TArray<FSpeechLineHandle>& Handles, const FString& SourceAudio) const
+{
+	FSpeechCostEstimate Estimate;
+	Estimate.BillingUnit = ESpeechBillingUnit::Seconds;
+
+	const USpeechForgeSettings* Settings = USpeechForgeSettings::Get();
+	if (!Settings)
+	{
+		return Estimate;
+	}
+
+	Estimate.Currency = Settings->Currency;
+
+	// One shared source measured once, rather than per line: converting a whole bank from a single
+	// file is the batch case, and re-reading it for every handle would be the same answer at cost.
+	float SharedSeconds = -1.f;
+	if (!SourceAudio.IsEmpty())
+	{
+		if (FPaths::FileExists(SourceAudio))
+		{
+			SharedSeconds = FSpeechImporter::ReadWavDuration(SourceAudio);
+		}
+		else if (const USoundWave* Wave = LoadObject<USoundWave>(nullptr, *SourceAudio))
+		{
+			SharedSeconds = Wave->Duration;
+		}
+		else
+		{
+			SharedSeconds = 0.f;
+		}
+	}
+
+	for (const FSpeechLineHandle& Handle : ExpandHandles(Handles))
+	{
+		UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+		ISpeechLineSource* Source = AsLineSource(Asset);
+		if (!Source)
+		{
+			continue;
+		}
+
+		const FSpeechLine* Line = Source->FindLine(Handle.LineId);
+		if (!Line)
+		{
+			continue;
+		}
+
+		++Estimate.LineCount;
+
+		float Seconds = SharedSeconds;
+		if (Seconds < 0.f)
+		{
+			// No source given, so the question is what a re-cast would send: whatever this line was
+			// converted from last time.
+			const USoundWave* Wave = Line->SourceSound.LoadSynchronous();
+			Seconds = Wave ? Wave->Duration : 0.f;
+		}
+
+		if (Seconds <= 0.f)
+		{
+			++Estimate.UnpricedCount;
+			continue;
+		}
+
+		Estimate.TotalSeconds += Seconds;
+
+		const FSpeechVoiceResolution Resolution = ResolveVoice(Handle);
+		TSharedPtr<ISpeechProvider> Provider = FindProvider(Resolution.ProviderId);
+
+		// Metered *and* able to convert: a provider that cannot re-voice would never be sent this
+		// audio, so counting it would price an operation that will not happen.
+		if (Provider.IsValid() && Provider->GetCaps().bIsMetered && Provider->GetCaps().bSupportsVoiceConversion)
+		{
+			Estimate.bAnyMetered = true;
+			Estimate.BilledSeconds += Seconds;
+		}
+	}
+
+	if (Estimate.bAnyMetered && Settings->CostPerMinuteOfAudio > 0.f)
+	{
+		Estimate.EstimatedCost = (Estimate.BilledSeconds / 60.f) * Settings->CostPerMinuteOfAudio;
 	}
 
 	return Estimate;
@@ -965,9 +1830,23 @@ void USpeechForgeSubsystem::OnLineSynthesized(
 
 	const USpeechForgeSettings* Settings = USpeechForgeSettings::Get();
 
+	// A localised bank's sounds land in a per-language subfolder. Same asset names by design -
+	// SW_<LineId> is the naming scheme - so without the folder split, generating German would
+	// overwrite the English audio it was translated from.
+	FString SoundsPath = Settings ? Settings->GetSoundsPath() : TEXT("/Game/_Generated/Speech/Sounds");
+	if (const USpeechBank* OwningBank = Cast<USpeechBank>(Asset))
+	{
+		if (!OwningBank->LanguageCode.IsEmpty())
+		{
+			FString LanguageFolder = OwningBank->LanguageCode.ToUpper();
+			LanguageFolder.ReplaceCharInline(TEXT('-'), TEXT('_'));
+			SoundsPath = SoundsPath / LanguageFolder;
+		}
+	}
+
 	FSpeechImportRequest Import;
 	Import.AbsoluteAudioPath = Result.AbsoluteAudioPath;
-	Import.DestinationPackagePath = Settings ? Settings->GetSoundsPath() : TEXT("/Game/_Generated/Speech/Sounds");
+	Import.DestinationPackagePath = SoundsPath;
 	Import.AssetName = FString::Printf(TEXT("SW_%s"), *Handle.LineId.ToString());
 	Import.Alignment = Result.Alignment;
 	Import.LineId = Line->LineId;
@@ -1005,6 +1884,8 @@ void USpeechForgeSubsystem::OnLineSynthesized(
 		Line->Sound = Imported.Sound;
 		Line->GeneratedSound = Imported.Sound;
 		Line->ImportedAudioHash = Imported.AudioHash;
+		Line->SpokenTextHash = FSpeechLine::ComputeSpokenTextHash(Line->Text);
+		Line->AudioCheckedAt = FDateTime::UtcNow();
 		Line->LastError = FString::Join(Imported.Warnings, TEXT(" "));
 
 		if (Batch)
@@ -1032,6 +1913,873 @@ void USpeechForgeSubsystem::OnLineSynthesized(
 }
 
 // -------------------------------------------------------------------------------------------------
+// Takes - candidates on a ledger
+// -------------------------------------------------------------------------------------------------
+
+namespace
+{
+	/** A take id unique within its line: time-based, suffixed only on collision. */
+	FName MakeTakeId(const FSpeechLine& Line)
+	{
+		const FString Base = FString::Printf(TEXT("T_%s"), *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S")));
+		FString Candidate = Base;
+		int32 Suffix = 1;
+		while (Line.FindTake(FName(*Candidate)) != nullptr)
+		{
+			Candidate = FString::Printf(TEXT("%s_%d"), *Base, ++Suffix);
+		}
+		return FName(*Candidate);
+	}
+}
+
+void USpeechForgeSubsystem::GenerateLineTake(const FSpeechLineHandle& Handle, FOnTakeGenerated OnComplete)
+{
+	const auto Fail = [&OnComplete](const FString& Error)
+	{
+		UE_LOG(LogSpeechForge, Error, TEXT("%s"), *Error);
+		OnComplete(false, FSpeechLineTake(), Error);
+	};
+
+	UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+	ISpeechLineSource* Source = AsLineSource(Asset);
+	FSpeechLine* Line = Source ? Source->FindLineMutable(Handle.LineId) : nullptr;
+	if (!Line)
+	{
+		return Fail(FString::Printf(TEXT("No line at '%s'."), *Handle.ToString()));
+	}
+
+	FSpeechSynthesisRequest Request;
+	FString Hash;
+	FString Error;
+	if (!BuildRequest(Handle, Request, Hash, Error))
+	{
+		return Fail(Error);
+	}
+
+	TSharedPtr<ISpeechProvider> Provider = FindProvider(Request.Voice.ProviderId);
+	if (!Provider.IsValid())
+	{
+		return Fail(TEXT("No provider for this line's resolved voice."));
+	}
+
+	const USpeechForgeSettings* Settings = USpeechForgeSettings::Get();
+	const FName TakeId = MakeTakeId(*Line);
+
+	const FString Staging = Settings ? Settings->GetAbsoluteStagingDirectory() : FPaths::ProjectSavedDir();
+	Request.AbsoluteOutputPath = Staging /
+		FString::Printf(TEXT("%s_%s.%s"),
+			*FSpeechImporter::SanitizeAssetName(Handle.LineId.ToString()),
+			*TakeId.ToString(),
+			*Provider->GetAudioFormat());
+
+	const FSpeechVoiceResolution Resolution = Request.Voice;
+
+	// Deliberately no Status = Generating on the line: a detached candidate is not the pipeline
+	// touching the line, and the panel must not report a line busy that is not.
+	Provider->Synthesize(Request,
+		[this, Handle, Hash, Resolution, TakeId, OnComplete](const FSpeechSynthesisResult& Result)
+	{
+		UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+		ISpeechLineSource* Source = AsLineSource(Asset);
+		FSpeechLine* Line = Source ? Source->FindLineMutable(Handle.LineId) : nullptr;
+
+		if (!Line)
+		{
+			OnComplete(false, FSpeechLineTake(), TEXT("The line disappeared while its take generated."));
+			return;
+		}
+
+		if (!Result.bSuccess)
+		{
+			UE_LOG(LogSpeechForge, Error, TEXT("Take for '%s' failed: %s"),
+				*Handle.LineId.ToString(), *Result.Error);
+			OnComplete(false, FSpeechLineTake(), Result.Error);
+			return;
+		}
+
+		const USpeechForgeSettings* Settings = USpeechForgeSettings::Get();
+
+		FSpeechImportRequest Import;
+		Import.AbsoluteAudioPath = Result.AbsoluteAudioPath;
+		Import.DestinationPackagePath =
+			(Settings ? Settings->GetSoundsPath() : TEXT("/Game/_Generated/Speech/Sounds")) / TEXT("Takes");
+		Import.AssetName = FSpeechImporter::SanitizeAssetName(
+			FString::Printf(TEXT("SW_%s_%s"), *Handle.LineId.ToString(), *TakeId.ToString()));
+		Import.Alignment = Result.Alignment;
+		Import.LineId = Line->LineId;
+		Import.SpeakerId = Line->SpeakerId;
+		Import.SourceAssetPath = Handle.AssetPath;
+		Import.bVerifyDuration = Settings ? Settings->bVerifyAlignmentAgainstDuration : true;
+		Import.DurationToleranceSeconds = Settings ? Settings->AlignmentDurationToleranceSeconds : 0.05f;
+
+		const FSpeechImportResult Imported = FSpeechImporter::Import(Import);
+		if (!Imported.bSuccess)
+		{
+			OnComplete(false, FSpeechLineTake(), Imported.Error);
+			return;
+		}
+
+		FSpeechLineTake Take;
+		Take.TakeId = TakeId;
+		Take.Kind = ESpeechTakeKind::Generated;
+		Take.SoundPath = Imported.Sound.ToString();
+		Take.CreatedAt = FDateTime::UtcNow();
+		Take.DurationSeconds = Imported.ImportedDurationSeconds;
+		Take.ContentHash = Hash;
+		Take.ProviderRequestId = Result.RequestId;
+		Take.GeneratedWith = Resolution;
+		Take.Alignment = Result.Alignment;
+		Take.ImportedAudioHash = Imported.AudioHash;
+		Take.SpokenTextHash = FSpeechLine::ComputeSpokenTextHash(Line->Text);
+		Take.BilledCharacters = Result.BilledCharacters;
+
+		Line->Takes.Add(Take);
+		Asset->MarkPackageDirty();
+		SaveAsset(Asset);
+
+		UE_LOG(LogSpeechForge, Log, TEXT("Take %s for '%s' -> %s (%.2fs, %d chars billed). Line untouched."),
+			*TakeId.ToString(), *Handle.LineId.ToString(), *Take.SoundPath,
+			Take.DurationSeconds, Take.BilledCharacters);
+
+		OnComplete(true, Take, FString());
+	});
+}
+
+FString USpeechForgeSubsystem::RegisterRecordedTake(
+	const FSpeechLineHandle& Handle,
+	const FString& WavAbsolutePath,
+	const FString& TakeDir,
+	FString& OutError)
+{
+	UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+	ISpeechLineSource* Source = AsLineSource(Asset);
+	FSpeechLine* Line = Source ? Source->FindLineMutable(Handle.LineId) : nullptr;
+	if (!Line)
+	{
+		OutError = FString::Printf(TEXT("No line at '%s'."), *Handle.ToString());
+		return FString();
+	}
+
+	if (!FPaths::FileExists(WavAbsolutePath))
+	{
+		OutError = FString::Printf(TEXT("No audio file at '%s'."), *WavAbsolutePath);
+		return FString();
+	}
+
+	const USpeechForgeSettings* Settings = USpeechForgeSettings::Get();
+	const FName TakeId = MakeTakeId(*Line);
+
+	FSpeechImportRequest Import;
+	Import.AbsoluteAudioPath = WavAbsolutePath;
+	Import.DestinationPackagePath =
+		(Settings ? Settings->GetSoundsPath() : TEXT("/Game/_Generated/Speech/Sounds")) / TEXT("Takes");
+	Import.AssetName = FSpeechImporter::SanitizeAssetName(
+		FString::Printf(TEXT("SW_%s_%s"), *Handle.LineId.ToString(), *TakeId.ToString()));
+	Import.LineId = Line->LineId;
+	Import.SpeakerId = Line->SpeakerId;
+	Import.SourceAssetPath = Handle.AssetPath;
+	Import.bVerifyDuration = false;
+
+	const FSpeechImportResult Imported = FSpeechImporter::Import(Import);
+	if (!Imported.bSuccess)
+	{
+		OutError = Imported.Error;
+		return FString();
+	}
+
+	FSpeechLineTake Take;
+	Take.TakeId = TakeId;
+	Take.Kind = ESpeechTakeKind::Recorded;
+	Take.SoundPath = Imported.Sound.ToString();
+	Take.TakeDir = TakeDir;
+	Take.CreatedAt = FDateTime::UtcNow();
+	Take.DurationSeconds = Imported.ImportedDurationSeconds;
+	Take.ImportedAudioHash = Imported.AudioHash;
+
+	// The script as it read when this was performed. A rewrite after the session leaves the take
+	// exactly as valid as it was and exactly as wrong for the new words, and the ledger says so.
+	Take.SpokenTextHash = FSpeechLine::ComputeSpokenTextHash(Line->Text);
+
+	Line->Takes.Add(Take);
+	Asset->MarkPackageDirty();
+	SaveAsset(Asset);
+
+	UE_LOG(LogSpeechForge, Log, TEXT("Recorded take %s registered for '%s' (%.2fs). Line untouched until chosen."),
+		*TakeId.ToString(), *Handle.LineId.ToString(), Take.DurationSeconds);
+
+	return TakeId.ToString();
+}
+
+TArray<FSpeechLineTake> USpeechForgeSubsystem::GetLineTakes(const FSpeechLineHandle& Handle) const
+{
+	UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+	ISpeechLineSource* Source = AsLineSource(Asset);
+	const FSpeechLine* Line = Source ? Source->FindLine(Handle.LineId) : nullptr;
+	return Line ? Line->Takes : TArray<FSpeechLineTake>();
+}
+
+FName USpeechForgeSubsystem::GetChosenTakeId(const FSpeechLineHandle& Handle) const
+{
+	UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+	ISpeechLineSource* Source = AsLineSource(Asset);
+	const FSpeechLine* Line = Source ? Source->FindLine(Handle.LineId) : nullptr;
+	return Line ? Line->ChosenTakeId : NAME_None;
+}
+
+bool USpeechForgeSubsystem::ApplyLineTake(const FSpeechLineHandle& Handle, FName TakeId, FString& OutError)
+{
+	UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+	ISpeechLineSource* Source = AsLineSource(Asset);
+	FSpeechLine* Line = Source ? Source->FindLineMutable(Handle.LineId) : nullptr;
+	if (!Line)
+	{
+		OutError = FString::Printf(TEXT("No line at '%s'."), *Handle.ToString());
+		return false;
+	}
+
+	const FSpeechLineTake* Take = Line->FindTake(TakeId);
+	if (!Take)
+	{
+		OutError = FString::Printf(TEXT("No take '%s' on line '%s'."),
+			*TakeId.ToString(), *Handle.LineId.ToString());
+		return false;
+	}
+
+	if (Take->Kind == ESpeechTakeKind::Recorded)
+	{
+		// Graduation, exactly as the direct flow: Sound repoints, Origin flips to Recorded, the
+		// generated reference survives, and a later script edit reads as stale-plus-Recorded.
+		const FSpeechLineTake TakeCopy = *Take;
+
+		// A picked re-voicing is what this take sounds like now, so it is what graduates. The
+		// performance, the words and the provenance are the take's either way - only the voice
+		// differs - which is why this is a substitution here rather than a separate path.
+		FString AudioToApply = TakeCopy.SoundPath;
+		const FSpeechTakeAudio* PickedVariant = TakeCopy.ChosenVariantId.IsNone()
+			? nullptr
+			: TakeCopy.Variants.FindByPredicate([&TakeCopy](const FSpeechTakeAudio& Candidate)
+				{ return Candidate.VariantId == TakeCopy.ChosenVariantId; });
+
+		if (PickedVariant)
+		{
+			AudioToApply = PickedVariant->SoundPath;
+		}
+
+		const FString Applied = ApplyRecordedAudio(Handle.AssetPath, Handle.LineId, AudioToApply, OutError);
+		if (Applied.IsEmpty())
+		{
+			return false;
+		}
+
+		// ApplyRecordedAudio reloaded and saved the asset; re-find the line before bookkeeping.
+		Asset = LoadSourceAsset(Handle.AssetPath);
+		Source = AsLineSource(Asset);
+		Line = Source ? Source->FindLineMutable(Handle.LineId) : nullptr;
+		if (Line)
+		{
+			Line->ChosenTakeId = TakeId;
+
+			// The take knows how long it is; the line otherwise reports nothing, because a recording
+			// arrives with no alignment and nobody measured it on the way in.
+			Line->Alignment.DurationSeconds = PickedVariant
+				? PickedVariant->DurationSeconds : TakeCopy.DurationSeconds;
+
+			if (PickedVariant)
+			{
+				Line->GeneratedWith = PickedVariant->Voice;
+			}
+
+			Asset->MarkPackageDirty();
+			SaveAsset(Asset);
+		}
+		return true;
+	}
+
+	// A generated take applies its stored facts exactly as generation would have written them, so
+	// the line is indistinguishable from one generated directly - staleness included.
+	USoundWave* Wave = LoadObject<USoundWave>(nullptr, *Take->SoundPath);
+	if (!Wave)
+	{
+		OutError = FString::Printf(TEXT("The take's sound '%s' no longer exists."), *Take->SoundPath);
+		return false;
+	}
+
+	Line->Status = ESpeechLineStatus::Generated;
+	Line->Origin = ESpeechLineOrigin::Generated;
+	Line->ContentHash = Take->ContentHash;
+	Line->ProviderRequestId = Take->ProviderRequestId;
+	Line->GeneratedWith = Take->GeneratedWith;
+	Line->GeneratedCharacters = Take->BilledCharacters;
+	Line->GeneratedAt = Take->CreatedAt;
+	Line->Alignment = Take->Alignment;
+	Line->Sound = Wave;
+	Line->GeneratedSound = Wave;
+	Line->ImportedAudioHash = Take->ImportedAudioHash;
+
+	// A picked re-voicing wins over the take's own recording. Same performance, same words, same
+	// provenance - only the voice differs, so nothing else about the take's facts changes.
+	if (!Take->ChosenVariantId.IsNone())
+	{
+		if (const FSpeechTakeAudio* Variant = Take->Variants.FindByPredicate(
+			[Take](const FSpeechTakeAudio& Candidate) { return Candidate.VariantId == Take->ChosenVariantId; }))
+		{
+			if (USoundWave* VariantWave = LoadObject<USoundWave>(nullptr, *Variant->SoundPath))
+			{
+				Line->Sound = VariantWave;
+				Line->GeneratedWith = Variant->Voice;
+				Line->Alignment.DurationSeconds = Variant->DurationSeconds;
+				Line->ImportedAudioHash.Reset();
+			}
+		}
+	}
+
+	// From the take, never from the line's text as it reads now. A take performed against last
+	// week's script must arrive on the line still saying so.
+	Line->SpokenTextHash = Take->SpokenTextHash;
+	Line->AudioCheckedAt = FDateTime::UtcNow();
+	Line->LastError.Reset();
+	Line->ChosenTakeId = TakeId;
+
+	Asset->MarkPackageDirty();
+	SaveAsset(Asset);
+
+	UE_LOG(LogSpeechForge, Log, TEXT("Take %s is now line '%s'."),
+		*TakeId.ToString(), *Handle.LineId.ToString());
+	return true;
+}
+
+bool USpeechForgeSubsystem::MarkTakeChosen(const FSpeechLineHandle& Handle, FName TakeId)
+{
+	UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+	ISpeechLineSource* Source = AsLineSource(Asset);
+	FSpeechLine* Line = Source ? Source->FindLineMutable(Handle.LineId) : nullptr;
+	if (!Line || !Line->FindTake(TakeId))
+	{
+		return false;
+	}
+
+	Line->ChosenTakeId = TakeId;
+	Asset->MarkPackageDirty();
+	SaveAsset(Asset);
+	return true;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Conversion - a performance re-voiced
+// -------------------------------------------------------------------------------------------------
+
+void USpeechForgeSubsystem::ConvertLineAudio(
+	const FSpeechLineHandle& Handle,
+	const FString& SourceAudio,
+	FOnLineConverted OnComplete)
+{
+	const auto Fail = [&OnComplete](const FString& Error)
+	{
+		UE_LOG(LogSpeechForge, Error, TEXT("%s"), *Error);
+		OnComplete(false, Error);
+	};
+
+	UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+	ISpeechLineSource* Source = AsLineSource(Asset);
+	FSpeechLine* Line = Source ? Source->FindLineMutable(Handle.LineId) : nullptr;
+	if (!Line)
+	{
+		return Fail(FString::Printf(TEXT("No line at '%s'."), *Handle.ToString()));
+	}
+
+	// The source is a file on disk, an asset already in the project, or - when neither is given -
+	// whatever this line was converted from last time, which is what a re-cast needs.
+	FString AbsoluteSource;
+	USoundWave* SourceWave = nullptr;
+
+	if (SourceAudio.IsEmpty())
+	{
+		SourceWave = Line->SourceSound.LoadSynchronous();
+		if (!SourceWave)
+		{
+			return Fail(FString::Printf(
+				TEXT("'%s' has no source recording to convert. Give one, or record a take for it."),
+				*Handle.LineId.ToString()));
+		}
+	}
+	else if (FPaths::FileExists(SourceAudio))
+	{
+		AbsoluteSource = SourceAudio;
+	}
+	else
+	{
+		SourceWave = LoadObject<USoundWave>(nullptr, *SourceAudio);
+		if (!SourceWave)
+		{
+			return Fail(FString::Printf(TEXT("No audio at '%s' - not a file, not an asset."), *SourceAudio));
+		}
+	}
+
+	// An imported wave's source file is what the provider needs; there is no sense re-exporting
+	// audio the project imported from disk minutes ago.
+	if (SourceWave && AbsoluteSource.IsEmpty())
+	{
+#if WITH_EDITORONLY_DATA
+		if (SourceWave->AssetImportData)
+		{
+			AbsoluteSource = SourceWave->AssetImportData->GetFirstFilename();
+		}
+#endif
+		if (AbsoluteSource.IsEmpty() || !FPaths::FileExists(AbsoluteSource))
+		{
+			return Fail(FString::Printf(
+				TEXT("'%s' has no source file on disk any more, so there is nothing to send. Point at a WAV."),
+				*SourceWave->GetName()));
+		}
+	}
+
+	const FSpeechVoiceResolution Resolution = ResolveVoice(Handle);
+	if (!Resolution.IsValid())
+	{
+		return Fail(FString::Printf(
+			TEXT("'%s' resolves to no voice, so there is nothing to convert it into. Cast its speaker."),
+			*Handle.LineId.ToString()));
+	}
+
+	TSharedPtr<ISpeechProvider> Provider = FindProvider(Resolution.ProviderId);
+	if (!Provider.IsValid())
+	{
+		return Fail(FString::Printf(TEXT("Provider '%s' is not registered."), *Resolution.ProviderId.ToString()));
+	}
+
+	if (!Provider->GetCaps().bSupportsVoiceConversion)
+	{
+		return Fail(FString::Printf(
+			TEXT("%s cannot re-voice a recording. Use the performance as-is, or cast a voice on a provider that can."),
+			*Provider->GetDisplayName()));
+	}
+
+	const USpeechForgeSettings* Settings = USpeechForgeSettings::Get();
+	const FString Staging = Settings ? Settings->GetAbsoluteStagingDirectory() : FPaths::ProjectSavedDir();
+
+	FSpeechConversionRequest Request;
+	Request.AbsoluteSourcePath = AbsoluteSource;
+	Request.Voice = Resolution;
+	Request.AbsoluteOutputPath = Staging /
+		FString::Printf(TEXT("%s_converted_%s.%s"),
+			*FSpeechImporter::SanitizeAssetName(Handle.LineId.ToString()),
+			*FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S")),
+			*Provider->GetAudioFormat());
+
+	// The identity of what is being converted, captured before the call so the line can be told
+	// later whether its source has changed underneath it.
+	const FString SourceHash = FSpeechImporter::HashFile(AbsoluteSource);
+	const TWeakObjectPtr<USoundWave> SourceAsset = SourceWave;
+
+	// A conversion inherits the provenance of what it converted, because that is what provenance is
+	// for: knowing whether a person performed this. Re-voicing our own synthesis produces more
+	// synthesis and nothing irreplaceable is at stake. Re-voicing anything else - a recorded take, a
+	// WAV off disk - carries a performance that cannot be regenerated, and calling that Generated
+	// would let the pipeline overwrite it. Unattributable audio counts as a recording, deliberately:
+	// the cautious answer is the safe one here.
+	const bool bSourceIsOwnSynthesis =
+		SourceWave &&
+		Line->Origin == ESpeechLineOrigin::Generated &&
+		(SourceWave == Line->Sound.Get() || SourceWave == Line->GeneratedSound.Get());
+
+	UE_LOG(LogSpeechForge, Log, TEXT("Converting '%s' into %s..."),
+		*Handle.LineId.ToString(), *Resolution.ProviderVoiceId);
+
+	Provider->ConvertSpeech(Request,
+		[this, Handle, Resolution, SourceHash, SourceAsset, bSourceIsOwnSynthesis, OnComplete]
+		(const FSpeechSynthesisResult& Result)
+	{
+		UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+		ISpeechLineSource* Source = AsLineSource(Asset);
+		FSpeechLine* Line = Source ? Source->FindLineMutable(Handle.LineId) : nullptr;
+		if (!Line)
+		{
+			OnComplete(false, TEXT("The line disappeared while its audio converted."));
+			return;
+		}
+
+		if (!Result.bSuccess)
+		{
+			Line->LastError = Result.Error;
+			Asset->MarkPackageDirty();
+			UE_LOG(LogSpeechForge, Error, TEXT("Converting '%s' failed: %s"),
+				*Handle.LineId.ToString(), *Result.Error);
+			OnComplete(false, Result.Error);
+			return;
+		}
+
+		const USpeechForgeSettings* Settings = USpeechForgeSettings::Get();
+
+		FSpeechImportRequest Import;
+		Import.AbsoluteAudioPath = Result.AbsoluteAudioPath;
+		Import.DestinationPackagePath = Settings ? Settings->GetSoundsPath() : TEXT("/Game/_Generated/Speech/Sounds");
+		Import.AssetName = FSpeechImporter::SanitizeAssetName(
+			FString::Printf(TEXT("SW_Converted_%s"), *Handle.LineId.ToString()));
+		Import.LineId = Line->LineId;
+		Import.SpeakerId = Line->SpeakerId;
+		Import.SourceAssetPath = Handle.AssetPath;
+		Import.bVerifyDuration = false;
+
+		const FSpeechImportResult Imported = FSpeechImporter::Import(Import);
+		if (!Imported.bSuccess)
+		{
+			Line->LastError = Imported.Error;
+			Asset->MarkPackageDirty();
+			OnComplete(false, Imported.Error);
+			return;
+		}
+
+		// Graduation, exactly as a recording graduates: the performance is a person's, and the
+		// pipeline must never overwrite it. The generated take stays as the reference it was
+		// directed against.
+		if (Line->GeneratedSound.IsNull() && !Line->Sound.IsNull() &&
+			Line->Origin == ESpeechLineOrigin::Generated)
+		{
+			Line->GeneratedSound = Line->Sound;
+		}
+
+		Line->Sound = Imported.Sound;
+		Line->Origin = bSourceIsOwnSynthesis ? ESpeechLineOrigin::Generated : ESpeechLineOrigin::Recorded;
+		Line->Status = ESpeechLineStatus::Generated;
+		Line->SourceSound = SourceAsset.Get();
+		Line->SourceAudioHash = SourceHash;
+		Line->ImportedAudioHash = Imported.AudioHash;
+		Line->GeneratedWith = Resolution;
+		Line->GeneratedAt = FDateTime::UtcNow();
+
+		// The old timings described the synthesised reading, not this performance - same words,
+		// different lengths. Wrong subtitle timings are worse than none, so they go rather than
+		// quietly drifting out of step with the audio.
+		if (Line->Alignment.DurationSeconds > 0.f)
+		{
+			UE_LOG(LogSpeechForge, Log,
+				TEXT("'%s' kept no character timings: a conversion returns none, and the previous "
+				     "reading's would describe different audio."),
+				*Handle.LineId.ToString());
+		}
+		Line->Alignment = FSpeechAlignment();
+		Line->Alignment.DurationSeconds = Imported.ImportedDurationSeconds;
+
+		// A conversion keeps the source's delivery *and its words*. ContentHash deliberately ignores
+		// the text, because re-converting cannot change what was said - but that is exactly why the
+		// subtitle question has to be asked separately here, and answered loudly.
+		Line->SpokenTextHash = FSpeechLine::ComputeSpokenTextHash(Line->Text);
+		Line->AudioCheckedAt = FDateTime::UtcNow();
+		Line->ProviderRequestId = Result.RequestId;
+		Line->LastError.Reset();
+
+		// Hashed over the source and the voice, never the text - see ComputeConversionHash.
+		Line->ContentHash = FSpeechLine::ComputeConversionHash(SourceHash, Resolution);
+
+		Asset->MarkPackageDirty();
+		SaveAsset(Asset);
+
+		const FString Message = FString::Printf(
+			TEXT("'%s' re-voiced into %s: %s (%.2fs)."),
+			*Handle.LineId.ToString(), *Resolution.ProviderVoiceId,
+			*Imported.Sound.ToString(), Imported.ImportedDurationSeconds);
+
+		UE_LOG(LogSpeechForge, Log, TEXT("%s"), *Message);
+		OnComplete(true, Message);
+	});
+}
+
+bool USpeechForgeSubsystem::SetTakeVariant(
+	const FSpeechLineHandle& Handle, FName TakeId, FName VariantId, FString& OutError)
+{
+	UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+	ISpeechLineSource* Source = AsLineSource(Asset);
+	FSpeechLine* Line = Source ? Source->FindLineMutable(Handle.LineId) : nullptr;
+
+	FSpeechLineTake* Take = Line
+		? Line->Takes.FindByPredicate([TakeId](const FSpeechLineTake& C) { return C.TakeId == TakeId; })
+		: nullptr;
+
+	if (!Take)
+	{
+		OutError = FString::Printf(TEXT("'%s' has no take %s."), *Handle.LineId.ToString(), *TakeId.ToString());
+		return false;
+	}
+
+	if (!VariantId.IsNone() && !Take->Variants.ContainsByPredicate(
+		[VariantId](const FSpeechTakeAudio& C) { return C.VariantId == VariantId; }))
+	{
+		OutError = FString::Printf(TEXT("Take %s has no voice %s."), *TakeId.ToString(), *VariantId.ToString());
+		return false;
+	}
+
+	Take->ChosenVariantId = VariantId;
+	Asset->MarkPackageDirty();
+	SaveAsset(Asset);
+	return true;
+}
+
+bool USpeechForgeSubsystem::RemoveTake(
+	const FSpeechLineHandle& Handle, FName TakeId, FString& OutError)
+{
+	UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+	ISpeechLineSource* Source = AsLineSource(Asset);
+	FSpeechLine* Line = Source ? Source->FindLineMutable(Handle.LineId) : nullptr;
+
+	const FSpeechLineTake* Take = Line
+		? Line->Takes.FindByPredicate([TakeId](const FSpeechLineTake& C) { return C.TakeId == TakeId; })
+		: nullptr;
+
+	if (!Take)
+	{
+		OutError = FString::Printf(TEXT("'%s' has no take %s."), *Handle.LineId.ToString(), *TakeId.ToString());
+		return false;
+	}
+
+	// In use is measured, not remembered: whether the line is actually playing this take's audio,
+	// its own or one of its voices.
+	const FString LineSound = Line->Sound.IsNull() ? FString() : Line->Sound.ToString();
+	bool bInUse = !LineSound.IsEmpty() && Take->SoundPath == LineSound;
+	for (const FSpeechTakeAudio& Variant : Take->Variants)
+	{
+		bInUse = bInUse || (!LineSound.IsEmpty() && Variant.SoundPath == LineSound);
+	}
+
+	if (bInUse)
+	{
+		OutError = FString::Printf(
+			TEXT("Take %s is the audio '%s' currently plays. Use another take first - removing this "
+			     "one would leave the line sounding like a take nothing remembers."),
+			*TakeId.ToString(), *Handle.LineId.ToString());
+		return false;
+	}
+
+	Line->Takes.RemoveAll([TakeId](const FSpeechLineTake& C) { return C.TakeId == TakeId; });
+
+	if (Line->ChosenTakeId == TakeId)
+	{
+		Line->ChosenTakeId = NAME_None;
+	}
+
+	Asset->MarkPackageDirty();
+	SaveAsset(Asset);
+	return true;
+}
+
+bool USpeechForgeSubsystem::RemoveTakeVariant(
+	const FSpeechLineHandle& Handle, FName TakeId, FName VariantId, FString& OutError)
+{
+	UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+	ISpeechLineSource* Source = AsLineSource(Asset);
+	FSpeechLine* Line = Source ? Source->FindLineMutable(Handle.LineId) : nullptr;
+
+	FSpeechLineTake* Take = Line
+		? Line->Takes.FindByPredicate([TakeId](const FSpeechLineTake& C) { return C.TakeId == TakeId; })
+		: nullptr;
+
+	if (!Take)
+	{
+		OutError = FString::Printf(TEXT("'%s' has no take %s."), *Handle.LineId.ToString(), *TakeId.ToString());
+		return false;
+	}
+
+	const int32 Removed = Take->Variants.RemoveAll(
+		[VariantId](const FSpeechTakeAudio& C) { return C.VariantId == VariantId; });
+
+	if (Removed == 0)
+	{
+		OutError = FString::Printf(TEXT("Take %s has no voice %s."), *TakeId.ToString(), *VariantId.ToString());
+		return false;
+	}
+
+	// The sound asset itself is left alone. Deleting content behind somebody's back is a different
+	// and much worse mistake than leaving an unreferenced asset in a folder.
+	if (Take->ChosenVariantId == VariantId)
+	{
+		Take->ChosenVariantId = NAME_None;
+	}
+
+	Asset->MarkPackageDirty();
+	SaveAsset(Asset);
+	return true;
+}
+
+void USpeechForgeSubsystem::ConvertTakeAudio(
+	const FSpeechLineHandle& Handle, FName TakeId, FOnLineConverted OnComplete)
+{
+	const auto Fail = [&OnComplete](const FString& Error)
+	{
+		UE_LOG(LogSpeechForge, Error, TEXT("%s"), *Error);
+		OnComplete(false, Error);
+	};
+
+	UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+	ISpeechLineSource* Source = AsLineSource(Asset);
+	FSpeechLine* Line = Source ? Source->FindLineMutable(Handle.LineId) : nullptr;
+
+	const FSpeechLineTake* Take = Line
+		? Line->Takes.FindByPredicate([TakeId](const FSpeechLineTake& C) { return C.TakeId == TakeId; })
+		: nullptr;
+
+	if (!Take)
+	{
+		return Fail(FString::Printf(TEXT("'%s' has no take %s."), *Handle.LineId.ToString(), *TakeId.ToString()));
+	}
+
+	USoundWave* SourceWave = LoadObject<USoundWave>(nullptr, *Take->SoundPath);
+	if (!SourceWave)
+	{
+		return Fail(FString::Printf(TEXT("Take %s has no audio to re-voice."), *TakeId.ToString()));
+	}
+
+	FString AbsoluteSource;
+#if WITH_EDITORONLY_DATA
+	if (SourceWave->AssetImportData)
+	{
+		AbsoluteSource = SourceWave->AssetImportData->GetFirstFilename();
+	}
+#endif
+	if (AbsoluteSource.IsEmpty() || !FPaths::FileExists(AbsoluteSource))
+	{
+		return Fail(FString::Printf(
+			TEXT("Take %s has no source file on disk any more, so there is nothing to send."),
+			*TakeId.ToString()));
+	}
+
+	const FSpeechVoiceResolution Resolution = ResolveVoice(Handle);
+	if (!Resolution.IsValid())
+	{
+		return Fail(FString::Printf(
+			TEXT("'%s' resolves to no voice. Cast its speaker before re-voicing a take."),
+			*Handle.LineId.ToString()));
+	}
+
+	// This take may already have been heard in this exact voice. Converting again would produce a
+	// second, indistinguishable entry and charge for it - which is precisely what happened when
+	// applying a choice re-entered this function: four identical "Sarah" rows, three of them paid
+	// for by accident. A voice is made once per take.
+	if (const FSpeechTakeAudio* Existing = Take->Variants.FindByPredicate(
+		[&Resolution](const FSpeechTakeAudio& Candidate)
+		{ return Candidate.Voice.ToHashString() == Resolution.ToHashString(); }))
+	{
+		const FName ExistingId = Existing->VariantId;
+		const FString ExistingLabel = Existing->Label;
+
+		FString SelectError;
+		SetTakeVariant(Handle, TakeId, ExistingId, SelectError);
+
+		const FString Message = FString::Printf(
+			TEXT("Take %s already had this voice (%s), so nothing was re-voiced or charged for."),
+			*TakeId.ToString(), *ExistingLabel);
+
+		UE_LOG(LogSpeechForge, Log, TEXT("%s"), *Message);
+		OnComplete(true, Message);
+		return;
+	}
+
+	TSharedPtr<ISpeechProvider> Provider = FindProvider(Resolution.ProviderId);
+	if (!Provider.IsValid() || !Provider->GetCaps().bSupportsVoiceConversion)
+	{
+		return Fail(FString::Printf(
+			TEXT("%s cannot re-voice a recording."),
+			Provider.IsValid() ? *Provider->GetDisplayName() : *Resolution.ProviderId.ToString()));
+	}
+
+	const USpeechForgeSettings* Settings = USpeechForgeSettings::Get();
+	const FString Staging = Settings ? Settings->GetAbsoluteStagingDirectory() : FPaths::ProjectSavedDir();
+
+	const FName VariantId(*FString::Printf(TEXT("V_%s"), *FDateTime::Now().ToString(TEXT("%H%M%S"))));
+
+	FSpeechConversionRequest Request;
+	Request.AbsoluteSourcePath = AbsoluteSource;
+	Request.Voice = Resolution;
+	Request.AbsoluteOutputPath = Staging /
+		FString::Printf(TEXT("%s_%s.%s"),
+			*FSpeechImporter::SanitizeAssetName(TakeId.ToString()),
+			*VariantId.ToString(),
+			*Provider->GetAudioFormat());
+
+	// The label the picker shows. A resolution explains itself as "speaker X -> Sarah", and the half
+	// after the arrow is the only part a director cares about while listening.
+	FString Label = Resolution.SourceDescription;
+	int32 Arrow = INDEX_NONE;
+	if (Label.FindLastChar(TCHAR('>'), Arrow) && Arrow + 1 < Label.Len())
+	{
+		Label = Label.RightChop(Arrow + 1).TrimStartAndEnd();
+	}
+	if (Label.IsEmpty())
+	{
+		Label = Resolution.ProviderVoiceId;
+	}
+
+	UE_LOG(LogSpeechForge, Log, TEXT("Re-voicing take %s into %s..."), *TakeId.ToString(), *Label);
+
+	Provider->ConvertSpeech(Request,
+		[this, Handle, TakeId, VariantId, Resolution, Label, OnComplete](const FSpeechSynthesisResult& Result)
+	{
+		UObject* Asset = LoadSourceAsset(Handle.AssetPath);
+		ISpeechLineSource* Source = AsLineSource(Asset);
+		FSpeechLine* Line = Source ? Source->FindLineMutable(Handle.LineId) : nullptr;
+
+		FSpeechLineTake* Take = Line
+			? Line->Takes.FindByPredicate([TakeId](const FSpeechLineTake& C) { return C.TakeId == TakeId; })
+			: nullptr;
+
+		if (!Take)
+		{
+			OnComplete(false, TEXT("The take disappeared while its audio converted."));
+			return;
+		}
+
+		if (!Result.bSuccess)
+		{
+			UE_LOG(LogSpeechForge, Error, TEXT("Re-voicing take %s failed: %s"), *TakeId.ToString(), *Result.Error);
+			OnComplete(false, Result.Error);
+			return;
+		}
+
+		const USpeechForgeSettings* LocalSettings = USpeechForgeSettings::Get();
+
+		FSpeechImportRequest Import;
+		Import.AbsoluteAudioPath = Result.AbsoluteAudioPath;
+		Import.DestinationPackagePath = LocalSettings
+			? LocalSettings->GetSoundsPath() / TEXT("Takes")
+			: TEXT("/Game/_Generated/Speech/Sounds/Takes");
+		Import.AssetName = FSpeechImporter::SanitizeAssetName(
+			FString::Printf(TEXT("SW_%s_%s"), *TakeId.ToString(), *VariantId.ToString()));
+		Import.LineId = Line->LineId;
+		Import.SpeakerId = Line->SpeakerId;
+		Import.SourceAssetPath = Handle.AssetPath;
+		Import.bVerifyDuration = false;
+
+		const FSpeechImportResult Imported = FSpeechImporter::Import(Import);
+		if (!Imported.bSuccess)
+		{
+			OnComplete(false, Imported.Error);
+			return;
+		}
+
+		FSpeechTakeAudio Variant;
+		Variant.VariantId = VariantId;
+		Variant.Label = Label;
+		Variant.SoundPath = Imported.Sound.ToString();
+		Variant.DurationSeconds = Imported.ImportedDurationSeconds;
+		Variant.Voice = Resolution;
+		Variant.CreatedAt = FDateTime::UtcNow();
+
+		Take->Variants.Add(MoveTemp(Variant));
+
+		// Picked on arrival, because the only reason to make one is to hear it.
+		Take->ChosenVariantId = VariantId;
+
+		Asset->MarkPackageDirty();
+		SaveAsset(Asset);
+
+		const FString Message = FString::Printf(
+			TEXT("Take %s can now be heard as %s (%.2fs). The take itself is unchanged."),
+			*TakeId.ToString(), *Label, Imported.ImportedDurationSeconds);
+
+		UE_LOG(LogSpeechForge, Log, TEXT("%s"), *Message);
+		OnComplete(true, Message);
+	});
+}
+
+// -------------------------------------------------------------------------------------------------
 // Graduation
 // -------------------------------------------------------------------------------------------------
 
@@ -1044,6 +2792,25 @@ bool USpeechForgeSubsystem::AcceptCurrentAudio(const FSpeechLineHandle& Handle)
 	if (!Line || Line->Status != ESpeechLineStatus::Generated)
 	{
 		return false;
+	}
+
+	// Accepting re-baselines the line, so it has to bank the same hash the status check will later
+	// recompute. For a conversion that is the source-and-voice hash; banking a text hash here would
+	// hand a blessed line straight back as permanently stale.
+	if (!Line->SourceAudioHash.IsEmpty())
+	{
+		const FSpeechVoiceResolution Resolution = ResolveVoice(Handle);
+
+		Line->ContentHash = FSpeechLine::ComputeConversionHash(Line->SourceAudioHash, Resolution);
+		Line->GeneratedWith = Resolution;
+		Line->Origin = ESpeechLineOrigin::Accepted;
+		Line->SpokenTextHash = FSpeechLine::ComputeSpokenTextHash(Line->Text);
+
+		Asset->MarkPackageDirty();
+		SaveAsset(Asset);
+
+		UE_LOG(LogSpeechForge, Log, TEXT("Accepted the converted audio on '%s'."), *Handle.LineId.ToString());
+		return true;
 	}
 
 	FSpeechSynthesisRequest Request;
@@ -1059,6 +2826,10 @@ bool USpeechForgeSubsystem::AcceptCurrentAudio(const FSpeechLineHandle& Handle)
 	Line->ContentHash = Hash;
 	Line->GeneratedWith = Request.Voice;
 	Line->Origin = ESpeechLineOrigin::Accepted;
+
+	// Accepting is a person saying "these words, this audio, good enough". That settles the subtitle
+	// question as much as the regeneration one, so both baselines move together.
+	Line->SpokenTextHash = FSpeechLine::ComputeSpokenTextHash(Line->Text);
 
 	Asset->MarkPackageDirty();
 	SaveAsset(Asset);
@@ -1095,6 +2866,8 @@ bool USpeechForgeSubsystem::MarkRecorded(const FSpeechLineHandle& Handle, const 
 	Line->Sound = Recorded;
 	Line->Origin = ESpeechLineOrigin::Recorded;
 	Line->ImportedAudioHash.Reset();
+	Line->SpokenTextHash = FSpeechLine::ComputeSpokenTextHash(Line->Text);
+	Line->AudioCheckedAt = FDateTime::UtcNow();
 
 	Asset->MarkPackageDirty();
 	SaveAsset(Asset);
@@ -1120,6 +2893,20 @@ int32 USpeechForgeSubsystem::DetectEditedAudio(const TArray<FSpeechLineHandle>& 
 		if (!Line || Line->Origin != ESpeechLineOrigin::Generated || Line->ImportedAudioHash.IsEmpty())
 		{
 			continue;
+		}
+
+		// The gate that makes this affordable enough to run unprompted. Hashing every sound in a bank
+		// means pulling every WAV payload off disk; asking the filesystem when the package was last
+		// written costs a stat, and audio inside a file nobody has rewritten cannot have been edited.
+		// So the expensive question is only asked where the cheap one already said something moved.
+		FString AudioFilename;
+		if (FPackageName::DoesPackageExist(Line->Sound.GetLongPackageName(), &AudioFilename))
+		{
+			const FDateTime Written = IFileManager::Get().GetTimeStamp(*AudioFilename);
+			if (Written != FDateTime::MinValue() && Written <= Line->AudioCheckedAt)
+			{
+				continue;
+			}
 		}
 
 		USoundWave* Sound = Line->Sound.LoadSynchronous();
@@ -1159,10 +2946,14 @@ int32 USpeechForgeSubsystem::DetectEditedAudio(const TArray<FSpeechLineHandle>& 
 		// The stored hash is of the file we imported; this is of what the asset holds now. They will
 		// differ the first time this runs against a line imported before this check existed, so a
 		// mismatch is only trusted when a hash was recorded in the same shape.
+		// Whatever the answer, the file has now been examined at this version, so the next sweep
+		// skips it at the stat.
+		Line->AudioCheckedAt = FDateTime::UtcNow();
+		Dirty.Add(Asset);
+
 		if (Line->ImportedAudioHash.Len() == Current.Len() && Line->ImportedAudioHash != Current)
 		{
 			Line->Origin = ESpeechLineOrigin::Edited;
-			Dirty.Add(Asset);
 			++Changed;
 
 			UE_LOG(LogSpeechForge, Log,

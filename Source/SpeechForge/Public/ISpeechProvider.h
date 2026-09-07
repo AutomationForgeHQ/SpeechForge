@@ -80,6 +80,58 @@ struct FSpeechRemoteVoice
 
 	/** Stock voices are worth flagging: a provider can retire them, taking your library with them. */
 	bool bIsPremade = false;
+
+	/**
+	 * A short audio sample of the voice, where the provider offers one. Empty otherwise, and a UI
+	 * shows no play button rather than a dead one.
+	 */
+	FString PreviewUrl;
+};
+
+/**
+ * One conversion: an existing performance re-voiced, keeping the delivery and changing the voice.
+ *
+ * Deliberately not a synthesis request with a file glued on. Nothing here is text - no script, no
+ * direction, no seed - because a conversion is not a reading of words; it is a recording wearing a
+ * different identity. Providers that cannot do it decline, and say so through
+ * FSpeechProviderCaps::bSupportsVoiceConversion.
+ */
+struct FSpeechConversionRequest
+{
+	/** Absolute path of the audio to convert - the source performance, whatever produced it. */
+	FString AbsoluteSourcePath;
+
+	/** The voice it becomes. Resolved before the call, never a reference. */
+	FSpeechVoiceResolution Voice;
+
+	/** Empty uses the provider's conversion default, which is rarely its synthesis model. */
+	FString ModelId;
+
+	/** Absolute path the converted audio is written to. */
+	FString AbsoluteOutputPath;
+};
+
+/**
+ * One dub: a recording carried into another language, delivery and voice intact.
+ *
+ * Like a conversion, this is not a synthesis request with a file glued on - no script and no seed,
+ * because the words come out of the recording itself. The one text-shaped field is the language
+ * pair, and the timing contract is the point: a dub fits the translated speech into the original's
+ * pacing, which is what keeps every layer aligned downstream.
+ */
+struct FSpeechDubbingRequest
+{
+	/** Absolute path of the audio to dub - the source performance. */
+	FString AbsoluteSourcePath;
+
+	/** BCP-47-ish code of the source language ("en"). Empty lets the service detect it. */
+	FString SourceLanguage;
+
+	/** BCP-47-ish code of the target language ("de"). Never empty. */
+	FString TargetLanguage;
+
+	/** Absolute path the dubbed audio is written to. Extension decides the expected container. */
+	FString AbsoluteOutputPath;
 };
 
 using FOnSpeechSynthesized     = TFunction<void(const FSpeechSynthesisResult&)>;
@@ -163,6 +215,19 @@ public:
 		return Text;
 	}
 
+	/**
+	 * Which plugin this provider ships in, for the shared Keys page.
+	 *
+	 * Not SpeechForge, for anything that actually has a key: the registration lives in the core,
+	 * because that is where providers announce themselves - so without this every key would be
+	 * attributed to SpeechForge, which is a core and spends nothing. Somebody uninstalling the
+	 * plugin that owns a key would go looking for the wrong one.
+	 *
+	 * Defaults to SpeechForge so a provider that forgets is merely unhelpful rather than wrong: a
+	 * provider compiled into the core genuinely would belong to it.
+	 */
+	virtual FText GetOwningPluginName() const { return NSLOCTEXT("SpeechForge", "OwnerCore", "SpeechForge"); }
+
 	/** Service name this provider's secret is stored under in the credential vault. */
 	virtual FString GetCredentialServiceName() const = 0;
 
@@ -177,6 +242,34 @@ public:
 
 	/** Generate one line. This is the call that costs money, and it costs it immediately. */
 	virtual void Synthesize(const FSpeechSynthesisRequest& Request, FOnSpeechSynthesized OnComplete) = 0;
+
+	/**
+	 * Re-voice an existing recording. Spends money the moment it is sent, exactly like synthesis.
+	 *
+	 * The result returns through the synthesis callback on purpose: what a caller needs afterwards
+	 * is identical - a file on disk and the billing that produced it - and two result types would
+	 * only force every caller to learn both.
+	 */
+	virtual void ConvertSpeech(const FSpeechConversionRequest& Request, FOnSpeechSynthesized OnComplete)
+	{
+		FSpeechSynthesisResult Result;
+		Result.Error = TEXT("This provider cannot re-voice a recording.");
+		OnComplete(Result);
+	}
+
+	/**
+	 * Dub a recording into another language, keeping the voice and the pacing.
+	 *
+	 * Spends money the moment it is sent, by the minute. Long-running on the provider's side -
+	 * implementations hide their own polling inside this call, exactly the way a job-shaped
+	 * Synthesize would, and complete on the game thread like everything else.
+	 */
+	virtual void DubSpeech(const FSpeechDubbingRequest& Request, FOnSpeechSynthesized OnComplete)
+	{
+		FSpeechSynthesisResult Result;
+		Result.Error = TEXT("This provider cannot dub a recording into another language.");
+		OnComplete(Result);
+	}
 
 	/**
 	 * Fetch a past generation again by its request id, without regenerating.
@@ -202,6 +295,18 @@ public:
 	{
 		OnComplete(false, {}, TEXT("This provider cannot list voices."));
 	}
+
+	/**
+	 * Where a human adds voices to this provider's account, when there is such a place.
+	 *
+	 * Optional, and contextual by construction: the guidance ships with the provider plugin that it
+	 * is about, the panel renders whatever the active provider declares, and core names nobody.
+	 * Empty means the browser shows no link.
+	 */
+	virtual FString GetVoiceLibraryUrl() const { return FString(); }
+
+	/** One or two sentences telling a human how voices get onto this account, shown with the link. */
+	virtual FText GetVoiceLibraryHint() const { return FText::GetEmpty(); }
 
 	// ---------------------------------------------------------------------------------------------
 	// Deliberately absent

@@ -74,6 +74,18 @@ public:
 	/** SHA1 of a file's bytes, for detecting a hand-edited asset later. */
 	static FString HashFile(const FString& AbsolutePath);
 
+	/**
+	 * How long a WAV on disk plays, without importing it.
+	 *
+	 * Needed to price a conversion, which bills by duration: the file has to be measured *before*
+	 * anything is sent, and importing it first would create an asset nobody asked for. Walks the
+	 * RIFF chunks rather than assuming a 44-byte header, because a WAV written by anything other
+	 * than the simplest encoder carries extra chunks ahead of `data`.
+	 *
+	 * Returns 0 when the file cannot be read or is not a WAV - an unknown duration, never a guess.
+	 */
+	static float ReadWavDuration(const FString& AbsolutePath);
+
 	/** Make a string safe to use as an asset name. */
 	static FString SanitizeAssetName(const FString& In);
 };

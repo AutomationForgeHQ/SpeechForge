@@ -1,4 +1,9 @@
-// The two seams: where lines come from, and where voices come from.
+// The seam lines come from.
+//
+// There used to be a second seam here - ISpeechVoiceSource, an external resolver consulted between
+// a line's override and its bank default. It is gone on purpose: the speaker asset (USpeechSpeaker)
+// is now the one place a speaker's voice consolidates, and adapters *seed and link* speaker sheets
+// rather than competing with them at resolution time. One place to look, one place to edit.
 
 #pragma once
 
@@ -50,46 +55,4 @@ public:
 		GetLineIds(Ids);
 		return Ids.Num();
 	}
-};
-
-/**
- * Anything that can decide which voice a line is spoken in.
- *
- * A plain C++ interface registered on the module rather than a UInterface, for the same reason
- * providers are: a resolver is a service belonging to a plugin, not a property of an asset, and it
- * has to be findable before any particular asset is loaded.
- *
- * Sources are consulted in descending priority and the first to answer wins. The built-in source
- * reads the line's own override and its container's defaults; an adapter plugin registers a higher
- * or lower priority one to map speakers onto voices from wherever it likes. SpeechForge never learns
- * what a source reads from, so deleting the plugin that registered one changes nothing but which
- * voices resolve.
- */
-class SPEECHFORGE_API ISpeechVoiceSource
-{
-public:
-
-	virtual ~ISpeechVoiceSource() = default;
-
-	/** Stable identifier, e.g. "NP_VoiceOver". Registering the same id twice replaces the first. */
-	virtual FName GetVoiceSourceId() const = 0;
-
-	/**
-	 * Higher is consulted first.
-	 *
-	 * The built-in source that reads a line's own override sits at 1000, so an adapter wanting to be
-	 * overridable by hand should sit below it, and one that must win should sit above and say why.
-	 */
-	virtual int32 GetPriority() const = 0;
-
-	/**
-	 * Answer the query, or decline.
-	 *
-	 * @return false to pass the question to the next source. Returning true with an invalid
-	 *         resolution is a bug - decline instead, so a later source still gets its turn.
-	 *
-	 * Fill in SourceDescription. It is what a human or an agent reads when a line comes out in the
-	 * wrong voice, and "open four assets and guess" is not an acceptable answer to that question.
-	 */
-	virtual bool ResolveVoice(const FSpeechVoiceQuery& Query, FSpeechVoiceResolution& OutResolution) const = 0;
 };

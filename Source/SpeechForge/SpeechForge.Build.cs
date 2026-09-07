@@ -67,8 +67,15 @@ public class SpeechForge : ModuleRules
 				"AudioEditor",      // USoundFactory lives here, not in UnrealEd as the include path suggests
 				"AssetTools",
 				"AssetRegistry",
+				"AssetDefinition",  // UAssetDefinition, which decides what double-click opens
 				"Slate",
 				"SlateCore",
+
+				// The Speech Library panel.
+				"InputCore",
+				"ToolMenus",
+				"WorkspaceMenuStructure",
+				"PropertyEditor",   // SObjectPropertyEntryBox, the Ingest page's source asset picker
 			}
 			);
 

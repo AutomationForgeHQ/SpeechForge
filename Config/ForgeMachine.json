@@ -1,16 +1,5 @@
 {
-	"_comment": "What this plugin needs from the machine rather than from a project. Read by the Automation Forge hub; the vault entry is what makes the hub and the editor address one row rather than two.",
+	"_comment": "What this plugin needs from the machine rather than from a project. Read by the Automation Forge hub. Empty on purpose: the core spends nothing. Keys belong to the provider plugins that spend them - the ElevenLabs key is declared by SpeechForgeElevenLabs.",
 
-	"keys": [
-		{
-			"id": "SpeechForge.ElevenLabs",
-			"displayName": "ElevenLabs",
-			"owner": "SpeechForge",
-			"purpose": "Voice generation through ElevenLabs. Your own account - we never resell speech.",
-			"optional": false,
-			"helpUrl": "https://elevenlabs.io/app/settings/api-keys",
-			"vaultEntry": "SpeechForge/ElevenLabs",
-			"environmentVariable": "SPEECHFORGE_ELEVENLABS_KEY"
-		}
-	]
+	"keys": []
 }

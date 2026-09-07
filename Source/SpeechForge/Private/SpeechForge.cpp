@@ -4,11 +4,22 @@
 #include "ForgeKeyRegistry.h"
 #endif
 #include "ISpeechProvider.h"
+#include "ISpeechTranslationProvider.h"
+#include "PseudoTranslationProvider.h"
 #include "SpeechSources.h"
 #include "SpeechCredentialStore.h"
 #include "SpeechForgeEditorSettings.h"
 #include "SpeechForgeSettings.h"
 #include "HAL/IConsoleManager.h"
+#include "SSpeechLibraryPanel.h"
+
+#include "Framework/Application/SlateApplication.h"
+#include "Framework/Docking/TabManager.h"
+#include "Styling/AppStyle.h"
+#include "ToolMenus.h"
+#include "Widgets/Docking/SDockTab.h"
+#include "WorkspaceMenuStructure.h"
+#include "WorkspaceMenuStructureModule.h"
 
 DEFINE_LOG_CATEGORY(LogSpeechForge);
 
@@ -72,7 +83,7 @@ namespace SpeechForgeConsole
 
 			const FName ProviderId = Args.Num() > 0
 				? FName(*Args[0])
-				: (USpeechForgeSettings::Get() ? USpeechForgeSettings::Get()->DefaultProviderId : NAME_None);
+				: Module->ResolveDefaultProviderId();
 
 			TSharedPtr<ISpeechProvider> Provider = Module->FindProvider(ProviderId);
 			if (!Provider.IsValid())
@@ -109,7 +120,7 @@ namespace SpeechForgeConsole
 
 			const FName ProviderId = Args.Num() > 0
 				? FName(*Args[0])
-				: (USpeechForgeSettings::Get() ? USpeechForgeSettings::Get()->DefaultProviderId : NAME_None);
+				: Module->ResolveDefaultProviderId();
 
 			TSharedPtr<ISpeechProvider> Provider = Module->FindProvider(ProviderId);
 			if (!Provider.IsValid())
@@ -133,15 +144,73 @@ namespace SpeechForgeConsole
 		}));
 }
 
+namespace SpeechLibrary
+{
+	static const FName TabName("SpeechLibrary");
+}
+
 void FSpeechForgeModule::StartupModule()
 {
 	UE_LOG(LogSpeechForge, Log, TEXT("SpeechForge started. No providers are built in - each registers itself."));
+
+	// The one translation provider that ships with the core: keyless pseudo-localisation, so the
+	// whole localisation pipeline is exercisable before any vendor plugin or key exists.
+	RegisterTranslationProvider(MakeShared<FPseudoTranslationProvider>());
+
+	FGlobalTabmanager::Get()
+		->RegisterNomadTabSpawner(SpeechLibrary::TabName,
+			FOnSpawnTab::CreateLambda([](const FSpawnTabArgs&)
+			{
+				return SNew(SDockTab)
+					.TabRole(ETabRole::NomadTab)
+					[
+						SNew(SSpeechLibraryPanel)
+					];
+			}))
+		.SetDisplayName(NSLOCTEXT("SpeechForge", "LibraryTabTitle", "Speech Library"))
+		.SetTooltipText(NSLOCTEXT("SpeechForge", "LibraryTabTip",
+			"Every line of a bank: what it says, who says it, what its audio is - and the ways to "
+			"give it one: generate it, or perform it."))
+		.SetIcon(FSlateIcon(FAppStyle::GetAppStyleSetName(), "ClassIcon.DialogueWave"))
+		// Hidden from the auto-populated Tools list: the family's own "Automation Forge" section
+		// below is the one entry, not a second one alphabetised among the engine's tools.
+		.SetMenuType(ETabSpawnerMenuType::Hidden)
+		.SetGroup(WorkspaceMenu::GetMenuStructure().GetToolsCategory());
+
+	ToolMenusHandle = UToolMenus::RegisterStartupCallback(
+		FSimpleMulticastDelegate::FDelegate::CreateLambda([]()
+		{
+			UToolMenu* Tools = UToolMenus::Get()->ExtendMenu("LevelEditor.MainMenu.Tools");
+			FToolMenuSection& Section = Tools->FindOrAddSection("AutomationForge",
+				NSLOCTEXT("SpeechForge", "ToolsSection", "Automation Forge"));
+
+			Section.AddMenuEntry(
+				"SpeechLibrary",
+				NSLOCTEXT("SpeechForge", "LibraryMenuLabel", "Speech Library"),
+				NSLOCTEXT("SpeechForge", "LibraryMenuTip",
+					"Every line of a bank, and the ways to give it a voice: generate it, or perform it."),
+				FSlateIcon(FAppStyle::GetAppStyleSetName(), "ClassIcon.DialogueWave"),
+				FUIAction(FExecuteAction::CreateLambda([]()
+				{
+					FGlobalTabmanager::Get()->TryInvokeTab(SpeechLibrary::TabName);
+				})));
+		}));
 }
 
 void FSpeechForgeModule::ShutdownModule()
 {
+	if (UToolMenus* Menus = UToolMenus::TryGet())
+	{
+		UToolMenus::UnRegisterStartupCallback(ToolMenusHandle);
+	}
+
+	if (FSlateApplication::IsInitialized())
+	{
+		FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(SpeechLibrary::TabName);
+	}
+
 	Providers.Empty();
-	VoiceSources.Empty();
+	TranslationProviders.Empty();
 }
 
 FSpeechForgeModule* FSpeechForgeModule::GetPtr()
@@ -182,7 +251,7 @@ void FSpeechForgeModule::RegisterProvider(TSharedRef<ISpeechProvider> Provider)
 		FForgeKeyProvider Key;
 		Key.Id = FName(*FString::Printf(TEXT("SpeechForge.%s"), *Id.ToString()));
 		Key.DisplayName = FText::FromString(Display);
-		Key.Owner = LOCTEXT("SpeechForgeOwner", "SpeechForge");
+		Key.Owner = Provider->GetOwningPluginName();
 		Key.Purpose = FText::Format(
 			LOCTEXT("SpeechKeyPurpose", "Voice generation through {0}. Your own account — we never resell speech."),
 			FText::FromString(Display));
@@ -249,51 +318,131 @@ TArray<FName> FSpeechForgeModule::GetProviderIds() const
 	return Ids;
 }
 
-void FSpeechForgeModule::RegisterVoiceSource(TSharedRef<ISpeechVoiceSource> Source)
+FName FSpeechForgeModule::ResolveDefaultProviderId() const
 {
-	const FName Id = Source->GetVoiceSourceId();
+	if (const USpeechForgeSettings* Settings = USpeechForgeSettings::Get())
+	{
+		if (!Settings->DefaultProviderId.IsNone())
+		{
+			return Settings->DefaultProviderId;
+		}
+	}
+
+	if (Providers.Num() == 1)
+	{
+		for (const auto& Pair : Providers)
+		{
+			return Pair.Key;
+		}
+	}
+
+	return NAME_None;
+}
+
+void FSpeechForgeModule::RegisterTranslationProvider(TSharedRef<ISpeechTranslationProvider> Provider)
+{
+	const FName Id = Provider->GetProviderId();
 	if (Id.IsNone())
 	{
-		UE_LOG(LogSpeechForge, Error, TEXT("A voice source tried to register without an id. Ignored."));
+		UE_LOG(LogSpeechForge, Error, TEXT("A translation provider tried to register without an id. Ignored."));
 		return;
 	}
 
-	UnregisterVoiceSource(Id);
-	VoiceSources.Add(Source);
-	SortVoiceSources();
+	// Replacing rather than refusing is what makes hot reload survivable.
+	TranslationProviders.Add(Id, Provider);
+	UE_LOG(LogSpeechForge, Log, TEXT("Registered translation provider '%s'."), *Id.ToString());
 
-	UE_LOG(LogSpeechForge, Log, TEXT("Registered voice source '%s' at priority %d."), *Id.ToString(), Source->GetPriority());
-	OnVoiceSourcesChanged.Broadcast();
+	// Keyed providers join the shared Keys page the same way speech providers do.
+#if WITH_FORGE_KEYS
+	const FString Service = Provider->GetCredentialServiceName();
+	if (!Service.IsEmpty())
+	{
+		if (IForgeKeysModule* Keys = IForgeKeysModule::GetOrLoad())
+		{
+			const FString Display = Provider->GetDisplayName();
+
+			FForgeKeyProvider Key;
+			Key.Id = FName(*FString::Printf(TEXT("SpeechForge.%s"), *Id.ToString()));
+			Key.DisplayName = FText::FromString(Display);
+			Key.Owner = LOCTEXT("TranslationKeyOwnerCore", "SpeechForge");
+			Key.Purpose = FText::Format(
+				LOCTEXT("TranslationKeyPurpose", "Line translation through {0}, for localised voice-over."),
+				FText::FromString(Display));
+			Key.HelpUrl = Provider->GetCredentialHelpUrl();
+			Key.VaultEntryName = FString::Printf(TEXT("SpeechForge/%s"), *Service);
+			Key.EnvironmentVariableName = FSpeechCredentialStore::GetEnvironmentVariableName(Service);
+
+			Key.IsSet    = [Service]() { return FSpeechCredentialStore::Has(Service); };
+			Key.Describe = [Service]() { return FSpeechCredentialStore::DescribeSource(Service); };
+			Key.Store    = [Service](const FString& Secret) { return FSpeechCredentialStore::Set(Service, Secret); };
+			Key.Clear    = [Service]() { return FSpeechCredentialStore::Remove(Service); };
+
+			Keys->Registry().Register(MoveTemp(Key));
+		}
+	}
+#endif
+
+	OnProvidersChanged.Broadcast();
 }
 
-void FSpeechForgeModule::UnregisterVoiceSource(FName SourceId)
+void FSpeechForgeModule::UnregisterTranslationProvider(FName ProviderId)
 {
-	const int32 Removed = VoiceSources.RemoveAll([SourceId](const TSharedPtr<ISpeechVoiceSource>& Source)
+	if (TranslationProviders.Remove(ProviderId) > 0)
 	{
-		return Source.IsValid() && Source->GetVoiceSourceId() == SourceId;
-	});
-
-	if (Removed > 0)
-	{
-		OnVoiceSourcesChanged.Broadcast();
+		UE_LOG(LogSpeechForge, Log, TEXT("Unregistered translation provider '%s'."), *ProviderId.ToString());
+#if WITH_FORGE_KEYS
+		if (IForgeKeysModule* Keys = IForgeKeysModule::GetIfLoaded())
+		{
+			Keys->Registry().Unregister(FName(*FString::Printf(TEXT("SpeechForge.%s"), *ProviderId.ToString())));
+		}
+#endif
+		OnProvidersChanged.Broadcast();
 	}
 }
 
-TArray<TSharedPtr<ISpeechVoiceSource>> FSpeechForgeModule::GetVoiceSources() const
+TSharedPtr<ISpeechTranslationProvider> FSpeechForgeModule::FindTranslationProvider(FName ProviderId) const
 {
-	return VoiceSources;
+	if (const TSharedPtr<ISpeechTranslationProvider>* Found = TranslationProviders.Find(ProviderId))
+	{
+		return *Found;
+	}
+	return nullptr;
 }
 
-void FSpeechForgeModule::SortVoiceSources()
+TArray<FName> FSpeechForgeModule::GetTranslationProviderIds() const
 {
-	// Descending priority, and stable, so two sources at the same priority keep registration order
-	// rather than resolving differently between runs.
-	VoiceSources.StableSort([](const TSharedPtr<ISpeechVoiceSource>& A, const TSharedPtr<ISpeechVoiceSource>& B)
+	TArray<FName> Ids;
+	TranslationProviders.GetKeys(Ids);
+	Ids.Sort(FNameLexicalLess());
+	return Ids;
+}
+
+FName FSpeechForgeModule::ResolveDefaultTranslationProviderId() const
+{
+	// The sole real provider wins; Pseudo never wins by default while a real one is installed,
+	// because placeholder text reaching a paid TTS call is money spent on gibberish.
+	static const FName PseudoId(TEXT("Pseudo"));
+
+	FName SoleReal = NAME_None;
+	int32 RealCount = 0;
+	for (const auto& Pair : TranslationProviders)
 	{
-		const int32 PriorityA = A.IsValid() ? A->GetPriority() : MIN_int32;
-		const int32 PriorityB = B.IsValid() ? B->GetPriority() : MIN_int32;
-		return PriorityA > PriorityB;
-	});
+		if (Pair.Key != PseudoId)
+		{
+			SoleReal = Pair.Key;
+			++RealCount;
+		}
+	}
+
+	if (RealCount == 1)
+	{
+		return SoleReal;
+	}
+	if (RealCount == 0 && TranslationProviders.Contains(PseudoId))
+	{
+		return PseudoId;
+	}
+	return NAME_None;
 }
 
 #undef LOCTEXT_NAMESPACE

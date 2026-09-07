@@ -38,6 +38,92 @@ public:
 	TArray<FSpeechLine> Lines;
 
 	// ---------------------------------------------------------------------------------------------
+	// Provenance - where these lines came from, when they came from anywhere
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * The adapter that harvested this bank, when one did. None means the bank is its own source.
+	 *
+	 * This is the key the two-way-sync contract matches on: a toolset function tagged
+	 * `SpeechLineSync` names the adapter it can write back through, the Speech Library offers it
+	 * only on banks stamped with the same key, and core never learns what the key means. An edit
+	 * made here and not written back is overwritten by the next harvest - the stamp is what lets
+	 * the panel say so instead of letting it happen silently.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Source")
+	FName SourceAdapter;
+
+	/**
+	 * Content path of the asset the lines were read from. Empty when the bank is its own source.
+	 *
+	 * Searchable so that the startup drift sweep can find every adapter-sourced bank in the project
+	 * without loading a single one - the asset registry answers from its cache, and only the banks
+	 * that actually have a source are ever opened.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, AssetRegistrySearchable, Category = "Source")
+	FString SourceAssetPath;
+
+	/**
+	 * Which speakers this bank harvests from its source, ";"-joined. Empty means all of them.
+	 *
+	 * The per-character division: one scene's dialogue can split across banks by actor, and this
+	 * records which slice is this bank's. Re-harvest applies it, so pulling new script lines never
+	 * drags another character's lines into a bank that was deliberately scoped.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Source")
+	FString SourceSpeakerFilter;
+
+	/**
+	 * When the source asset was last read into this bank.
+	 *
+	 * The source's own file time at harvest, not the wall clock, so the comparison that follows is
+	 * between two facts of the same kind. A dialogue written after this moment means somebody edited
+	 * the script somewhere this bank cannot see, and every line here may now disagree with it.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Source")
+	FDateTime SourceHarvestedAt = FDateTime();
+
+	// ---------------------------------------------------------------------------------------------
+	// Localisation - one bank per language, joined by line id
+	//
+	// A sibling bank per language rather than per-line language maps, because everything downstream
+	// - hashes, takes, face banks, dialogue assignment - already speaks "a bank and a line id", and
+	// a per-language bank means none of it learns anything new. The face bank for a language comes
+	// free the same way: face banks key themselves to a speech bank by path.
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * Language these lines are written and spoken in, e.g. "de" or "pt-BR".
+	 *
+	 * Empty on an authoring bank, which is what marks it as the source of truth. Searchable so
+	 * every localised bank in a project is enumerable from the registry cache without loading one.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, AssetRegistrySearchable, Category = "Localisation")
+	FString LanguageCode;
+
+	/**
+	 * Content path of the bank this one was translated from. Empty on an authoring bank.
+	 *
+	 * Searchable for the reverse question - which localisations does this bank have - answered from
+	 * the registry cache, exactly the way face banks find their speech bank.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, AssetRegistrySearchable, Category = "Localisation")
+	FString SourceBankPath;
+
+	/**
+	 * Every line id here, ";"-wrapped and ";"-joined (";BRK_Arrival;BRK_DepotLocked;"), rebuilt on
+	 * save.
+	 *
+	 * The one-line-one-home contract's index: a line identity is (LineId, LanguageCode) and exactly
+	 * one bank may hold it - its home. This tag lets "who is home for line X?" be answered from the
+	 * registry cache without loading a single bank, which is what makes ingest able to refuse
+	 * duplicates cheaply. Wrapped in delimiters so the match is by whole token - "BRK_Arrival" must
+	 * not be found inside "BRK_Arrival_Alt1".
+	 */
+	UPROPERTY(VisibleAnywhere, AssetRegistrySearchable, Category = "Localisation")
+	FString LineIdIndex;
+
+	// ---------------------------------------------------------------------------------------------
 	// ISpeechLineSource
 	// ---------------------------------------------------------------------------------------------
 
@@ -68,6 +154,9 @@ public:
 #if WITH_EDITOR
 	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
 #endif
+
+	/** Rebuilds LineIdIndex, so the registry tag always says what the saved bank holds. */
+	virtual void PreSave(FObjectPreSaveContext SaveContext) override;
 
 private:
 

@@ -75,9 +75,10 @@ FSpeechOutputPaths USpeechForgeSettings::GetOutputPaths() const
 	FSpeechOutputPaths Paths;
 
 	Paths.Root   = OutputContentPath;
-	Paths.Banks  = GetBanksPath();
-	Paths.Voices = GetVoicesPath();
-	Paths.Sounds = GetSoundsPath();
+	Paths.Banks    = GetBanksPath();
+	Paths.Voices   = GetVoicesPath();
+	Paths.Speakers = GetSpeakersPath();
+	Paths.Sounds   = GetSoundsPath();
 
 	return Paths;
 }

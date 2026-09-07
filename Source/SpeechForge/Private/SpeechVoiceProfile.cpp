@@ -1,6 +1,19 @@
-#include "SpeechVoice.h"
+#include "SpeechVoiceProfile.h"
 
-FSpeechVoiceResolution USpeechVoice::MakeResolution(
+FString USpeechVoiceProfile::GetLabel() const
+{
+	if (!DisplayName.IsEmpty())
+	{
+		return DisplayName;
+	}
+	if (!ProviderVoiceName.IsEmpty())
+	{
+		return ProviderVoiceName;
+	}
+	return GetName();
+}
+
+FSpeechVoiceResolution USpeechVoiceProfile::MakeResolution(
 	FName FallbackProviderId,
 	const FString& FallbackModelId,
 	const FString& InSourceDescription) const
@@ -16,14 +29,14 @@ FSpeechVoiceResolution USpeechVoice::MakeResolution(
 	return Resolution;
 }
 
-FString USpeechVoice::GetSetupProblem() const
+FString USpeechVoiceProfile::GetSetupProblem() const
 {
 	if (ProviderVoiceId.IsEmpty())
 	{
 		return FString::Printf(
 			TEXT("'%s' has no Provider Voice Id. Pick a voice on the provider and paste its id here; ")
 			TEXT("nothing can generate until it is paired."),
-			*GetName());
+			*GetLabel());
 	}
 
 	if (Provenance == ESpeechVoiceProvenance::Unknown)
@@ -34,7 +47,7 @@ FString USpeechVoice::GetSetupProblem() const
 		return FString::Printf(
 			TEXT("'%s' does not record how its voice was made. Set Provenance, so it is possible to ")
 			TEXT("tell later whether this voice can be recreated."),
-			*GetName());
+			*GetLabel());
 	}
 
 	return FString();

@@ -5,7 +5,7 @@
 #include "CoreMinimal.h"
 #include "SpeechForgeTypes.generated.h"
 
-class USpeechVoice;
+class USpeechVoiceProfile;
 
 /**
  * Where a line has got to in the pipeline.
@@ -281,6 +281,26 @@ struct SPEECHFORGE_API FSpeechProviderCaps
 	bool bSupportsVoiceListing = false;
 
 	/**
+	 * Whether this provider can re-voice an existing recording - speech to speech.
+	 *
+	 * Billed by the second rather than the character, which is why BillingUnit alone cannot answer
+	 * the question: a provider may charge per character to synthesise and per minute to convert.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Provider")
+	bool bSupportsVoiceConversion = false;
+
+	/**
+	 * Whether this provider can dub a recording into another language - translation, voice and
+	 * timing preserved in one operation.
+	 *
+	 * A different capability from conversion, not a variant of it: conversion changes *who* is
+	 * speaking and keeps the words, a dub keeps who is speaking and changes the words' language.
+	 * Billed by the minute, and expensively - estimate before batching.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Provider")
+	bool bSupportsDubbing = false;
+
+	/**
 	 * Whether a past generation can be fetched again from the provider, free, by its request id.
 	 *
 	 * This is what makes a non-reproducible provider survivable: where a seed cannot recreate a take,
@@ -348,6 +368,40 @@ FORCEINLINE uint32 GetTypeHash(const FSpeechLineHandle& Handle)
 }
 
 /**
+ * A bank whose source script has been written since the bank last read it.
+ *
+ * The drift nobody presses a button to discover. A dialogue edited in its own editor leaves every
+ * harvested line here describing the old script, and the bank has no way to notice on its own -
+ * so the check is a sweep, and the sweep is cheap enough to run unasked because it compares file
+ * times before it opens anything.
+ */
+USTRUCT(BlueprintType)
+struct SPEECHFORGE_API FSpeechSourceDrift
+{
+	GENERATED_BODY()
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Drift")
+	FString BankPath;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Drift")
+	FString SourceAssetPath;
+
+	/** Which adapter harvested it, and therefore which one can re-harvest it. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Drift")
+	FName SourceAdapter;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Drift")
+	FDateTime HarvestedAt = FDateTime();
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Drift")
+	FDateTime SourceWrittenAt = FDateTime();
+
+	/** How many of the bank's lines carry audio, i.e. how much is at risk if the script did change. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Drift")
+	int32 LinesWithAudio = 0;
+};
+
+/**
  * What a set of lines would cost to generate.
  *
  * Unlike most generation pipelines this is arithmetic rather than a projection: where billing is per
@@ -384,6 +438,33 @@ struct SPEECHFORGE_API FSpeechCostEstimate
 	/** Lines skipped because they are current, graduated, or already in flight. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Cost")
 	int32 SkippedCount = 0;
+
+	/**
+	 * Which quantity actually bills, so a reader knows whether to trust characters or seconds.
+	 *
+	 * Synthesis bills characters and conversion bills seconds; an estimate that reported only one
+	 * of them would be silently wrong for the other half of the pipeline.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Cost")
+	ESpeechBillingUnit BillingUnit = ESpeechBillingUnit::Characters;
+
+	/** Seconds of source audio that would be sent, where the operation bills by duration. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Cost")
+	float TotalSeconds = 0.f;
+
+	/** Of those, the ones on a metered provider. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Cost")
+	float BilledSeconds = 0.f;
+
+	/**
+	 * Lines that would bill but whose duration could not be read.
+	 *
+	 * Never folded into the total as a guess. A conversion is charged for audio that exists, so a
+	 * source the pipeline cannot measure is a number nobody should be shown - it is reported as
+	 * unknown and priced at nothing, which is wrong in the direction that cannot overspend.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Cost")
+	int32 UnpricedCount = 0;
 };
 
 /**
@@ -406,9 +487,13 @@ struct SPEECHFORGE_API FSpeechOutputPaths
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Output")
 	FString Banks;
 
-	/** Speech voice assets: which provider voice a character speaks with. */
+	/** Voice profile assets: the instruments - provider, preset, model, settings. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Output")
 	FString Voices;
+
+	/** Speaker assets: the cast - identity, voice profile, external links. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Output")
+	FString Speakers;
 
 	/** Imported sound waves. The audio itself. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Output")
@@ -508,6 +593,38 @@ struct SPEECHFORGE_API FSpeechLineStatus
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Status")
 	FString StaleReason;
 
+	/**
+	 * The audio says something other than what the line says.
+	 *
+	 * Reported apart from bStale because it is a different kind of problem with a different fix. A
+	 * stale *voice* is a setting that moved and a button that puts it back. Drifted *words* mean a
+	 * shipped subtitle would contradict the audio under it, and on a recorded or re-voiced line no
+	 * button in this pipeline can resolve that - only a person, with a microphone.
+	 */
+	/**
+	 * The audio is a re-voicing rather than the performance as it was captured.
+	 *
+	 * Origin says whether a person made this; it does not say whose voice you hear. Both matter, and
+	 * on a re-voiced take they are different answers - the delivery is the actor's, the voice is
+	 * not, and a list saying only "Recorded" leaves the second half untold.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Status")
+	bool bRevoiced = false;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Status")
+	bool bWordsDrifted = false;
+
+	/**
+	 * There is audio, but nothing recorded what it says, so the subtitle cannot be checked at all.
+	 *
+	 * True for lines whose audio predates this baseline. Deliberately not treated as either current
+	 * or drifted: stamping today's text would silence a real mismatch, and calling it stale would
+	 * cry wolf over lines that are probably fine. It is reported as unknown because on a shipping
+	 * pipeline "unverifiable" is a state somebody has to clear on purpose.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Status")
+	bool bWordsUnverified = false;
+
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Status")
 	FName SpeakerId;
 
@@ -558,7 +675,7 @@ struct SPEECHFORGE_API FSpeechLineSpec
 
 	/** Leave unset to resolve through the speaker and the asset's defaults. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Speech|Advanced")
-	TSoftObjectPtr<USpeechVoice> VoiceOverride;
+	TSoftObjectPtr<USpeechVoiceProfile> VoiceOverride;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Speech|Advanced")
 	FString ModelOverride;
@@ -570,4 +687,40 @@ struct SPEECHFORGE_API FSpeechLineSpec
 	/** The line this one follows, so prosody carries across a conversation. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Speech|Advanced")
 	FName PreviousLineId;
+};
+
+/**
+ * One localised bank's standing against its source, counted rather than guessed.
+ *
+ * "Current" means the translation matches the source text as it stands today; audio staleness is a
+ * separate axis the ordinary line status already reports per bank.
+ */
+USTRUCT(BlueprintType)
+struct SPEECHFORGE_API FSpeechLocalizationStatus
+{
+	GENERATED_BODY()
+
+	/** Language of the localised bank, e.g. "de". */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Localisation")
+	FString LanguageCode;
+
+	/** Content path of the localised bank. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Localisation")
+	FString BankPath;
+
+	/** Source lines with a translation whose source text has not moved since. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Localisation")
+	int32 LinesCurrent = 0;
+
+	/** Source lines whose text changed after they were translated. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Localisation")
+	int32 LinesStale = 0;
+
+	/** Source lines with no translation at all. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Localisation")
+	int32 LinesMissing = 0;
+
+	/** Translated lines that have generated or recorded audio. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Localisation")
+	int32 LinesWithAudio = 0;
 };

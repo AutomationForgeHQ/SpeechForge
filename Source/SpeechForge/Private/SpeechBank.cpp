@@ -1,6 +1,24 @@
 #include "SpeechBank.h"
 
 #include "SpeechForge.h"
+#include "UObject/ObjectSaveContext.h"
+
+void USpeechBank::PreSave(FObjectPreSaveContext SaveContext)
+{
+	// The home index rides every save, so the registry tag can never disagree with the asset for
+	// longer than an unsaved edit. ";"-wrapped tokens, so lookups match whole ids only.
+	FString Index = TEXT(";");
+	for (const FSpeechLine& Line : Lines)
+	{
+		if (!Line.LineId.IsNone())
+		{
+			Index += Line.LineId.ToString() + TEXT(";");
+		}
+	}
+	LineIdIndex = Lines.Num() > 0 ? Index : FString();
+
+	Super::PreSave(SaveContext);
+}
 
 void USpeechBank::GetLineIds(TArray<FName>& OutLineIds) const
 {

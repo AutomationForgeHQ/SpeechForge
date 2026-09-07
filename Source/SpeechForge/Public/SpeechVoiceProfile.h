@@ -1,40 +1,47 @@
-// A speaker, paired with a provider's voice.
+// A voice as an instrument: a provider's preset, plus everything that makes it repeatable.
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
 #include "SpeechForgeTypes.h"
-#include "SpeechVoice.generated.h"
+#include "SpeechVoiceProfile.generated.h"
 
 /**
- * The pairing between a character in this project and a voice on a provider.
+ * A voice profile: one voice, ready to be cast.
  *
- * One asset per speaking role. Everything that makes a performance repeatable lives here - the
- * provider, its voice id, the model, and the settings - so that a line only has to say who is
- * talking.
+ * The instrument, not the character. A profile names a provider, that provider's voice preset, the
+ * model and the settings - everything that makes a performance repeatable - and deliberately says
+ * nothing about who speaks in it. Speakers reference profiles (see USpeechSpeaker); two characters
+ * can share one, and re-casting a character never edits a profile.
  *
- * Changing anything on this asset marks every line that resolves to it stale, because the audio
+ * Because the profile owns the provider, a project mixes providers freely - the question "which
+ * vendor" is answered per voice, never per bank.
+ *
+ * Changing anything here marks every line that resolves through it stale, because the audio
  * genuinely no longer matches what the project says it should be. That is correct and it is
  * expensive; see the staleness report before regenerating a cast.
  */
-UCLASS(BlueprintType, meta = (DisplayName = "Speech Voice"))
-class SPEECHFORGE_API USpeechVoice : public UDataAsset
+UCLASS(BlueprintType, meta = (DisplayName = "Speech Voice Profile"))
+class SPEECHFORGE_API USpeechVoiceProfile : public UDataAsset
 {
 	GENERATED_BODY()
 
 public:
 
 	/**
-	 * Who this is, in project terms.
-	 *
-	 * The key an external voice source matches a line's SpeakerId against, so it is worth keeping
-	 * identical to whatever the rest of the project calls this character.
+	 * What this voice is called in this project. Falls back to the provider's name for it, then the
+	 * asset name. This is the string every panel shows, so name the sound, not a character -
+	 * "Warm Male Narrator", not "Player".
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Voice")
-	FName SpeakerId;
+	FString DisplayName;
 
-	/** Free text for whoever inherits this. Casting notes, accent, age, the read you were after. */
+	/** The provider's own display name for the preset ("Sarah"), cached when the voice was browsed. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Voice")
+	FString ProviderVoiceName;
+
+	/** Free text for whoever inherits this. What the voice sounds like, what it was chosen for. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Voice", meta = (MultiLine = true))
 	FString Description;
 
@@ -46,7 +53,7 @@ public:
 	 * The provider's own identifier for this voice.
 	 *
 	 * Opaque, and the one field that cannot be reconstructed from anything else. Losing it means
-	 * re-casting the character.
+	 * re-casting every speaker that uses this profile.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Provider")
 	FString ProviderVoiceId;
@@ -80,9 +87,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Provenance", meta = (MultiLine = true))
 	FString CloneSourceNotes;
 
-	/** When the pairing was made, for tracing a voice that has since changed on the provider's side. */
+	/** When the profile was made, for tracing a voice that has since changed on the provider's side. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Provenance")
-	FDateTime PairedAt = FDateTime();
+	FDateTime CreatedAt = FDateTime();
 
 	// ---------------------------------------------------------------------------------------------
 	// Queries
@@ -90,8 +97,11 @@ public:
 
 	bool IsPaired() const { return !ProviderVoiceId.IsEmpty(); }
 
+	/** The name a human should read: DisplayName, else the provider's name, else the asset name. */
+	FString GetLabel() const;
+
 	/**
-	 * Build a resolution from this asset.
+	 * Build a resolution from this profile.
 	 *
 	 * @param FallbackProviderId Used when ProviderId is unset.
 	 * @param FallbackModelId Used when ModelId is empty.
@@ -102,6 +112,6 @@ public:
 		const FString& FallbackModelId,
 		const FString& InSourceDescription) const;
 
-	/** Why this voice cannot be used yet, or empty when it can. */
+	/** Why this profile cannot be used yet, or empty when it can. */
 	FString GetSetupProblem() const;
 };

@@ -25,10 +25,18 @@ namespace
 	FString ResolveService(FName ProviderId, bool& bOutNoProviders)
 	{
 		bOutNoProviders = false;
-		FString Service = ProviderId.IsNone() ? TEXT("ElevenLabs") : ProviderId.ToString();
+		FString Service = ProviderId.ToString();
 
 		if (FSpeechForgeModule* Module = FSpeechForgeModule::GetPtrIfLoaded())
 		{
+			// An empty field means "whichever provider is the default" - the same resolution
+			// generation uses, so this page and a batch never disagree about whose key it is.
+			if (ProviderId.IsNone())
+			{
+				ProviderId = Module->ResolveDefaultProviderId();
+				Service = ProviderId.ToString();
+			}
+
 			if (TSharedPtr<ISpeechProvider> Provider = Module->FindProvider(ProviderId))
 			{
 				Service = Provider->GetCredentialServiceName();

@@ -51,6 +51,62 @@ FString FSpeechImporter::HashFile(const FString& AbsolutePath)
 	return BytesToHex(Digest, FSHA1::DigestSize);
 }
 
+float FSpeechImporter::ReadWavDuration(const FString& AbsolutePath)
+{
+	TArray<uint8> Bytes;
+	if (!FFileHelper::LoadFileToArray(Bytes, *AbsolutePath) || Bytes.Num() < 44)
+	{
+		return 0.f;
+	}
+
+	auto Tag = [&Bytes](int32 Offset)
+	{
+		return (Offset + 4 <= Bytes.Num())
+			? FString(4, reinterpret_cast<const ANSICHAR*>(Bytes.GetData() + Offset))
+			: FString();
+	};
+	auto Read32 = [&Bytes](int32 Offset) -> uint32
+	{
+		uint32 Value = 0;
+		FMemory::Memcpy(&Value, Bytes.GetData() + Offset, sizeof(uint32));
+		return Value;
+	};
+
+	if (Tag(0) != TEXT("RIFF") || Tag(8) != TEXT("WAVE"))
+	{
+		return 0.f;
+	}
+
+	uint32 BytesPerSecond = 0;
+	uint32 DataBytes = 0;
+
+	// Chunks are walked rather than indexed: anything but the simplest encoder writes LIST or fact
+	// chunks ahead of the audio, and a fixed 44-byte assumption reads those as samples.
+	for (int32 Offset = 12; Offset + 8 <= Bytes.Num(); )
+	{
+		const FString ChunkId = Tag(Offset);
+		const uint32 ChunkSize = Read32(Offset + 4);
+
+		if (ChunkId == TEXT("fmt ") && Offset + 20 <= Bytes.Num())
+		{
+			BytesPerSecond = Read32(Offset + 16);
+		}
+		else if (ChunkId == TEXT("data"))
+		{
+			DataBytes = ChunkSize;
+			break;
+		}
+
+		// Chunks pad to even boundaries, and an odd size that is not rounded walks the reader one
+		// byte out of step for the rest of the file.
+		Offset += 8 + ChunkSize + (ChunkSize & 1);
+	}
+
+	return (BytesPerSecond > 0 && DataBytes > 0)
+		? static_cast<float>(DataBytes) / static_cast<float>(BytesPerSecond)
+		: 0.f;
+}
+
 FSpeechImportResult FSpeechImporter::Import(const FSpeechImportRequest& Request)
 {
 	FSpeechImportResult Result;

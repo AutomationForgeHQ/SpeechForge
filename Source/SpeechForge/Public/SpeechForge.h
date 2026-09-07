@@ -4,19 +4,19 @@
 #include "Logging/LogMacros.h"
 
 class ISpeechProvider;
-class ISpeechVoiceSource;
+class ISpeechTranslationProvider;
 
 /** Filter the Output Log on "LogSpeechForge" to follow resolve, price, synthesize and import. */
 SPEECHFORGE_API DECLARE_LOG_CATEGORY_EXTERN(LogSpeechForge, Log, All);
 
 /**
- * SpeechForge's module, and the two registries add-on plugins join.
+ * SpeechForge's module, and the provider registry add-on plugins join.
  *
- * Both registries live here rather than on the subsystem for one reason: module startup order. An
+ * The registry lives here rather than on the subsystem for one reason: module startup order. An
  * add-on loads and registers whenever its own loading phase says, which may be before or after the
- * editor builds the subsystem. Holding the lists on the module means neither order loses a
+ * editor builds the subsystem. Holding the list on the module means neither order loses a
  * registration - the subsystem reads whatever is present when it comes up, and hears about anything
- * that arrives later through the change delegates.
+ * that arrives later through the change delegate.
  *
  * Shared pointers rather than IModularFeature: the pipeline hands providers into callbacks that
  * outlive the call, and a raw pointer whose owning module unloaded mid-batch is a crash rather than
@@ -66,42 +66,52 @@ public:
 	TSharedPtr<ISpeechProvider> FindProvider(FName ProviderId) const;
 	TArray<FName> GetProviderIds() const;
 
+	/**
+	 * The provider to use when nothing names one.
+	 *
+	 * The settings value when it is set; otherwise the sole registered provider, because a machine
+	 * with exactly one provider plugin enabled has already made the choice. With several registered
+	 * and none named this returns NAME_None and the caller reports rather than picking - providers
+	 * bill different accounts, and a silent guess spends the wrong one.
+	 *
+	 * This exists because the setting used to default to a vendor by name, which meant the core
+	 * could not be built without that vendor's plugin mattering. It defaults to None now, and this
+	 * is the one place that decides what None means.
+	 */
+	FName ResolveDefaultProviderId() const;
+
 	DECLARE_MULTICAST_DELEGATE(FOnProvidersChanged);
 	FOnProvidersChanged OnProvidersChanged;
 
 	// ---------------------------------------------------------------------------------------------
-	// Voice sources - who decides which voice a line is spoken in
+	// Translation providers - who can turn one language's text into another's
+	//
+	// A second registry rather than a flag on speech providers, because the two capabilities have
+	// nothing in common but the word "provider": different vendors, different keys, different
+	// billing. The core ships one keyless implementation ("Pseudo") so the localisation pipeline
+	// is exercisable before anyone signs up for anything.
 	// ---------------------------------------------------------------------------------------------
 
+	void RegisterTranslationProvider(TSharedRef<ISpeechTranslationProvider> Provider);
+	void UnregisterTranslationProvider(FName ProviderId);
+
+	TSharedPtr<ISpeechTranslationProvider> FindTranslationProvider(FName ProviderId) const;
+	TArray<FName> GetTranslationProviderIds() const;
+
 	/**
-	 * Make an external voice resolver available.
+	 * The translation provider to use when nothing names one.
 	 *
-	 * This is how a line gets a voice from somewhere SpeechForge knows nothing about - an NPC
-	 * definition, a casting table, a localisation sheet. Sources are consulted in descending priority
-	 * and the first to answer wins; see FSpeechVoiceResolution and the resolution order documented on
-	 * the subsystem.
-	 *
-	 * SpeechForge never learns what a source is or where it reads from, so deleting the plugin that
-	 * registered one changes nothing except which voices resolve.
+	 * The sole registered *real* provider when there is exactly one - Pseudo does not count,
+	 * because a machine with DeepL installed has made its choice and must not fall back to
+	 * placeholder text by accident. Pseudo only when it is all there is. NAME_None when several
+	 * real providers are registered and none was named, and the caller reports rather than picking.
 	 */
-	void RegisterVoiceSource(TSharedRef<ISpeechVoiceSource> Source);
-
-	/** Take a voice source back out again. */
-	void UnregisterVoiceSource(FName SourceId);
-
-	/** Every registered source, already sorted highest priority first. */
-	TArray<TSharedPtr<ISpeechVoiceSource>> GetVoiceSources() const;
-
-	DECLARE_MULTICAST_DELEGATE(FOnVoiceSourcesChanged);
-	FOnVoiceSourcesChanged OnVoiceSourcesChanged;
+	FName ResolveDefaultTranslationProviderId() const;
 
 private:
 
-	/** Re-sort VoiceSources by descending priority. Called whenever the set changes. */
-	void SortVoiceSources();
+	FDelegateHandle ToolMenusHandle;
 
 	TMap<FName, TSharedPtr<ISpeechProvider>> Providers;
-
-	/** Kept as an array rather than a map because resolution order is the whole point. */
-	TArray<TSharedPtr<ISpeechVoiceSource>> VoiceSources;
+	TMap<FName, TSharedPtr<ISpeechTranslationProvider>> TranslationProviders;
 };

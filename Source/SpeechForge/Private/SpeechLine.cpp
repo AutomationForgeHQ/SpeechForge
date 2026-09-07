@@ -46,6 +46,51 @@ FSpeechLineSpec FSpeechLine::ToSpec() const
 	return Spec;
 }
 
+FString FSpeechLine::ComputeSpokenTextHash(const FString& Text)
+{
+	// Whitespace is normalised away deliberately. Re-indenting a line in a dialogue editor, or a
+	// harvest that trims differently than the last one, is not a script change - and an alarm that
+	// cries wolf over a trailing space is an alarm people learn to ignore, which is worse than none.
+	FString Normalised = Text;
+	Normalised.TrimStartAndEndInline();
+	Normalised.ReplaceInline(TEXT("\r\n"), TEXT("\n"));
+
+	const FString Combined = FString::Printf(TEXT("t1|%s"), *Normalised);
+	const FTCHARToUTF8 Utf8(*Combined);
+
+	FSHA1 Sha;
+	Sha.Update(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length());
+	Sha.Final();
+
+	uint8 Digest[FSHA1::DigestSize];
+	Sha.GetHash(Digest);
+
+	return BytesToHex(Digest, FSHA1::DigestSize);
+}
+
+FString FSpeechLine::ComputeConversionHash(
+	const FString& SourceAudioHash,
+	const FSpeechVoiceResolution& Voice)
+{
+	// A conversion reads no words, so no text goes in - which is the whole point. The script can be
+	// rewritten a dozen times and a re-voiced performance is still exactly as valid as it was; what
+	// invalidates it is a different source recording or a different voice, and both are here.
+	const FString Combined = FString::Printf(TEXT("c1|%s|%s"),
+		*SourceAudioHash,
+		*Voice.ToHashString());
+
+	const FTCHARToUTF8 Utf8(*Combined);
+
+	FSHA1 Sha;
+	Sha.Update(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length());
+	Sha.Final();
+
+	uint8 Digest[FSHA1::DigestSize];
+	Sha.GetHash(Digest);
+
+	return BytesToHex(Digest, FSHA1::DigestSize);
+}
+
 FString FSpeechLine::ComputeContentHash(
 	const FString& RequestText,
 	const FSpeechVoiceResolution& Voice,

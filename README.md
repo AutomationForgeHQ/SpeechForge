@@ -22,8 +22,10 @@ SpeechForge produces a `USoundWave` and stops there. It deliberately does **not*
 trees, subtitles, montages, facial animation, or any gameplay framework.
 
 Those are conventions belonging to whatever consumes the audio, and baking them in would tie this
-plugin to one project's way of working. `NP_VoiceOver` is the planned adapter that binds this to
-Narrative Pro's dialogue system; it is a separate plugin and does not exist yet.
+plugin to one project's way of working. `NP_VoiceOver` is the adapter that binds this to Narrative
+Pro's dialogue system — a separate plugin: it harvests dialogues into banks and seeds speaker
+sheets, and SpeechForge never learns it exists. Narrative is one terminal use case, not the frame;
+the same contracts serve barks, game dialogue, or lines for a short film.
 
 The test for what belongs here is one question: *would a project with no dialogue system still want
 this?* Text in, sound asset out, with timings — yes. Everything else, no.
@@ -61,19 +63,31 @@ it. This is the failure mode this plugin is most carefully built against, and it
 
 ---
 
-## Voices resolve, they are not named
+## Speakers, profiles, and how a voice resolves
+
+The order of work is the screenwriter's: **cast, then write, then produce.** Before a scene, its
+speakers are defined; then lines are written carrying a speaker id; then generation and recording
+run on top. Two assets carry the first step:
+
+- **`USpeechSpeaker`** — the character sheet: the speaker id lines carry, a display name, casting
+  notes, the voice profile they speak in, and an `ExternalBindings` map where adapter plugins
+  record what this speaker is elsewhere ("NarrativePro" → an NPC definition). The set of speaker
+  assets *is* the cast list — there is no separate mapping table.
+- **`USpeechVoiceProfile`** — the instrument: one provider's voice preset, plus model, settings and
+  provenance, named for the sound and never for a character. Two speakers can share one, and
+  because the profile owns the provider, one project mixes providers freely.
 
 A line does not name a voice. It **resolves** one, walking four sources and taking the first answer:
 
-1. the line's own `VoiceOverride`
-2. **registered external sources**, highest priority first
-3. the container's default voice
+1. the line's own `VoiceOverride` — the by-hand exception
+2. **the speaker's sheet**, matched on `SpeakerId` through the asset registry
+3. the container's default profile
 4. the project default
 
-Step 2 is the point. An adapter plugin implements `ISpeechVoiceSource`, registers at module startup,
-and maps a speaker onto a voice from wherever it likes — an NPC definition, a casting table, a
-spreadsheet. SpeechForge never learns what it reads from, and deleting it changes nothing except
-which voices resolve.
+Adapters do not compete in this walk — that is a deliberate change from an earlier design that had
+a pluggable resolver seam. An adapter **seeds and links** speaker sheets instead (the NP_VoiceOver
+harvest creates one per dialogue speaker, with the NPC bound), so a speaker's voice has exactly one
+home, and deleting the adapter leaves dormant links rather than re-cast lines.
 
 Every resolution carries a `SourceDescription` saying which step answered, because when a line comes
 out in the wrong voice, *why did it resolve to that* is the only useful question and "open four
@@ -113,6 +127,15 @@ it is expensive. Three things make it bearable, and none of them is fudging the 
 this project: the same line, same voice, same settings, regenerated, came back **2.880s and then
 2.400s** — a twenty percent difference in length, never mind delivery. That is why only stale lines
 regenerate, ever.
+
+**One line's inputs live in another asset.** A dub is derived from a line in the source-language
+bank, and that line can be re-recorded afterwards without anything on the dub moving — same audio,
+same hashes, same text. So a dub also stores which recording it was made from
+(`DubbedFromAudioHash`), and the status pass compares it against the source line's hash today. This
+is the only staleness axis that reads a second asset, and it is cheap because the comparison is
+against a field the source already maintains rather than a re-read of its audio. An empty hash on
+either side reads as current: a question that cannot be asked is not a fault. See
+[LOCALIZATION.md](LOCALIZATION.md).
 
 ---
 
@@ -174,9 +197,13 @@ flagged `bFromNormalizedText` and a warning says it must not be used to position
 
 ## Providers are a capability tier, read not assumed
 
-`ElevenLabs` ships in this plugin as the first provider, the same way MotionForge ships Uthana.
-Additional providers are separate plugins that call `FSpeechForgeModule::RegisterProvider` at module
-startup; SpeechForge never learns they exist and deleting one changes nothing.
+SpeechForge ships **no** providers. Each one is a separate plugin that calls
+`FSpeechForgeModule::RegisterProvider` at module startup; SpeechForge never learns their names and
+deleting one changes nothing. ElevenLabs lives in
+[SpeechForgeElevenLabs](../SpeechForgeElevenLabs/README.md) - it was a folder inside this plugin
+until 2026-09-01, and extracting it is what removed the last vendor name from the core's defaults.
+With no default provider set, the sole registered provider is used; with several registered,
+generation asks for one to be named rather than guessing, because providers bill different accounts.
 
 Nothing above the provider line assumes anything. It asks `GetCaps`:
 
@@ -195,24 +222,15 @@ over-engineering; see below.
 
 ---
 
-## The model trade-off you cannot default correctly
+## Per-model quirks live with the provider
 
-Measured on a live account, not read:
+Which model takes inline direction, which one stitches, what a character limit is, which stability
+values a model actually accepts - all of it is a provider's private knowledge, asked through
+`GetCaps` and `SupportsStitchingForModel` rather than assumed. The measured ElevenLabs answers,
+including the trade-off that has no correct project-wide default, are in
+[SpeechForgeElevenLabs](../SpeechForgeElevenLabs/README.md).
 
-| | `eleven_v3` | `eleven_multilingual_v2` |
-|---|---|---|
-| Inline direction (audio tags) | **yes** | no |
-| Stitching (`previous_text`) | **rejected**, `unsupported_model` | yes |
-| Character limit | 5,000 | 10,000 |
-| Stability values | **0.0, 0.5 or 1.0 only** — anything between is a 422 | continuous |
-
-So the two things this pipeline most wants — direction, and prosody that carries across a
-conversation — are on **different models**. There is no correct project-wide default; it is a real
-per-bank decision. `eleven_v3` is the shipped default because direction is what makes the Direction
-field worth having, and a bank that cares more about continuity should be moved to
-`eleven_multilingual_v2`.
-
-SpeechForge drops stitching and logs when the model cannot take it, rather than failing the line —
+SpeechForge drops stitching and logs when the model cannot take it, rather than failing the line -
 and because stitching is not part of the content hash, dropping it marks nothing stale.
 
 ---
@@ -252,6 +270,40 @@ Verified live on 2026-08-11 against an ElevenLabs Creator account:
 
 ---
 
+## Localisation - a sibling bank per language
+
+Localising is three ordinary steps, none of which teaches anything downstream a new word:
+
+1. **Translate.** `LocalizeSpeechBank` turns `SB_Scene` into `SB_Scene_DE` beside it: the same line
+   ids, speakers, direction and overrides, only the text translated. A line re-translates when its
+   *source* text moves - each localised line carries the hash of the source text it was translated
+   from - and `GetSpeechLocalizationStatus` counts current / stale / missing per language from the
+   registry. Translation goes through its own provider seam (`ISpeechTranslationProvider`): the
+   core ships **Pseudo** (keyless pseudo-localisation, for proving the pipeline), and the
+   `SpeechForgeDeepL` add-on registers **DeepL**, whose untranslated `context` field carries "video
+   game dialogue" plus the bank description into every request.
+2. **Generate.** The localised bank generates like any other - the same speakers resolve the same
+   cast voices, the multilingual models speak whatever language the text is in, and the sounds land
+   in a per-language folder (`Sounds/DE/SW_<LineId>`), which is what stops German from overwriting
+   the English audio that shares its asset name.
+3. **Solve faces from the new audio.** A face bank prepared from the localised speech bank solves
+   from the localised sounds exactly like any other bank. Give it a per-language output path so its
+   baked `AS_Face_<ClipId>` assets do not collide with the originals'.
+
+**Recorded lines can be dubbed instead of re-read.** `DubSpeechLine` on a localised line sends the
+source line's recording through the speech provider's dubbing capability (ElevenLabs
+`/v1/dubbing`): the actor's voice, pacing and pauses survive into the target language, the line
+graduates to Recorded, and - deliberately - it reports **words-unverified**, because the dub's
+spoken wording is the dubbing service's own translation, not the subtitle's. Billed by the minute
+at a multiple of synthesis, and the key needs the **dubbing permission**. Because a dub keeps
+roughly the source's timing, a captured face's video layer stays aligned under the re-solved mouth -
+which is the whole reason the face pipeline stores layers instead of flattening
+(see `FaceForge/GRADUATION.md` §4).
+
+Localising a translation is refused - translate the authoring bank, or every error compounds.
+
+---
+
 ## Where things go
 
 | | |
@@ -259,6 +311,7 @@ Verified live on 2026-08-11 against an ElevenLabs Creator account:
 | `/Game/_Generated/Speech/Banks` | speech banks |
 | `/Game/_Generated/Speech/Voices` | voice assets |
 | `/Game/_Generated/Speech/Sounds` | imported `USoundWave`s |
+| `/Game/_Generated/Speech/Sounds/<LANG>` | a localised bank's sounds, e.g. `DE` |
 | `Saved/SpeechForge` | raw provider responses, **kept not deleted** |
 
 Sorted by kind at the point of generation, because a tool that writes everything into one folder
@@ -268,6 +321,76 @@ Raw responses are kept because where a seed cannot reproduce a generation, that 
 provider's own history are the only two copies — and only one of them survives the account closing.
 
 ---
+
+## The Speech Library
+
+**Tools > Automation Forge > Speech Library.** Pages behind one switcher, in the order the work
+actually happens. The **Ingest** page leads, and exists only when an installed plugin ships an
+ingestion method:
+
+- **Ingest** — where the lines come from, and everything about staying in step with it: the
+  bank's source and drift status, ingestion methods, and every discovered action tagged onto this
+  page. A toolset function tagged
+  `meta = (SpeechIngest = "Label", SpeechIngestClass = "/Script/Module.Class")` — two string
+  parameters: source asset path, then bank path — becomes a method row: a picker filtered to that
+  class (Blueprints are matched by native parent, which is what a Narrative dialogue is) and a
+  button. A `SpeechLibraryAction` additionally tagged `SpeechLibraryPage = "Ingest"` moves its
+  button here from the Produce bar — NP_VoiceOver's Re-harvest from Dialogue does, sitting beside
+  the drift warning it answers. The harvest stamps the bank's source (`SourceAdapter` +
+  `SourceAssetPath`, a plain path — no dialogue class is ever linked), so Re-harvest works from
+  then on without picking anything, and the picker shows the remembered source across editor
+  restarts when the method's `SpeechIngestAdapter` matches the stamp. Ingest is idempotent for
+  the same source — line ids are the source's own, so re-ingesting updates lines and keeps paid
+  audio. Ingesting a **different** source into a stamped bank asks first: replace (clear, then
+  ingest), merge, or cancel.
+- **Cast** — who is in the scene, and what they sound like. The cast list (every speaker sheet,
+  the current bank's people first, ids without a sheet one click from getting one), the project's
+  voice profiles with used-by counts, and the provider browser: fetch the account's voices,
+  audition any, then **Save as Profile** to keep one or **Cast** to hand it straight to the
+  selected speaker. Re-casting marks the speaker's lines stale; the report says so, nothing
+  regenerates by itself.
+- **Write** — the lines. Text and direction edit in place (double-click), the speaker cell is a
+  dropdown over the cast, and the voice cell names the resolved profile and opens the exception
+  flow: voice this one line differently, or clear the override and return to the speaker's voice.
+  **Delete Selected** removes lines (multi-select), **Clear All Lines** empties the bank keeping
+  its cast, language and source stamp — both confirm first, and neither touches generated audio
+  assets: a bank entry is a reference, deleting content is a human's call in the Content Browser.
+  (`RemoveSpeechLines` / `ClearSpeechBank` are the same operations as tools.)
+- **Produce** — the pipeline table (status, origin, staleness, duration), **Generate Selected**
+  with the exact cost beside the button before anything spends, **Generate All** (the whole bank,
+  idempotent — missing and stale lines generate, current ones cost nothing, a second press finds
+  nothing to do), **Re-generate Selected** (force, behind a costed confirmation that also says
+  how many lines are current and re-paid for; recorded, edited and accepted lines are never
+  overwritten even by force), **Dub from Source** on a localised bank (the alternative to
+  generating a line: carry the source language's performance across instead of re-reading the
+  translated text — see [LOCALIZATION.md](LOCALIZATION.md)), and the **discovered actions**:
+  any registered toolset function tagged `meta = (SpeechLibraryAction = "Label")` appears in the
+  action bar and receives the selection as JSON — installing a plugin adds buttons with no edit
+  to SpeechForge, and a third party gets the same seam we use.
+- **Perform** — lines become bodies. Appears only when a plugin tags an action onto it
+  (`SpeechLibraryPage = "Perform"`; FaceForge's Create/Update Face Bank is the canonical one).
+  Top: **To the game** — the delivery buttons, present only when something is installed that has
+  somewhere to deliver to. An action may add `SpeechLibraryGroup = "Dialogue"` to land here rather
+  than in the recording flow, because the page holds three kinds of verb — build the faces, record
+  a performance, hand the finished thing to the game — and an apply button filed under recording
+  reads as part of recording. NP_VoiceOver ships *Apply Voice to Dialogue* and *Apply Voice and
+  Faces to Dialogue*; neither takes a dialogue path, because the bank's source stamp names one.
+  Then: the face banks serving this bank, each one click from the Face Bank panel. Middle: the
+  lines with their **Rig** (the speaker sheet's manually settable `RigTarget` — the contract that
+  works with no game framework installed; "no rig" is fine for voice, fatal for faces), **Face**
+  (the line's clip status in the linked face bank, matched by line id), and **Sessions** (every
+  recording session containing the line). Bottom, when PerformanceForge is present: the session
+  fixtures, Plan Session/Record Selected, and the sessions covering this bank — found through the
+  session asset's registry-searchable `BankPaths` list (a session spans banks when one artist
+  records one character across scenes; older unstamped sessions are found the slow way once and
+  restamped). Foreign panels are opened by reflection, never by linking.
+
+Audition is everywhere audio is: a play glyph per line and per browsed voice, which becomes a stop
+glyph while playing — the playing row tints so it is findable from across the table, a second
+click stops it, and the state reverts on its own when the audio ends.
+
+Afterwards the same rows say what each line became: `Recorded` origin for a performed line, and
+stale-plus-Recorded when the script later changes under it - the pickup-session report.
 
 ## Console commands
 
