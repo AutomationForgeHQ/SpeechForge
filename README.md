@@ -7,7 +7,7 @@ character-level timing data attached to it.
 cast a voice once  →  author lines  →  price  →  generate  →  import, with timings
 ```
 
-**Status: 0.1 — verified end to end against a live ElevenLabs Creator account on 2026-08-11.** Three
+**Status: 0.2 — verified end to end against a live ElevenLabs Creator account on 2026-08-11.** Three
 lines across two speakers generated, imported at 48 kHz, and checked by reading the data back rather
 than the log. See [What is verified, and what is not](#what-is-verified-and-what-is-not).
 
@@ -135,7 +135,7 @@ same hashes, same text. So a dub also stores which recording it was made from
 is the only staleness axis that reads a second asset, and it is cheap because the comparison is
 against a field the source already maintains rather than a re-read of its audio. An empty hash on
 either side reads as current: a question that cannot be asked is not a fault. See
-[LOCALIZATION.md](LOCALIZATION.md).
+LOCALIZATION.md.
 
 ---
 
@@ -200,7 +200,7 @@ flagged `bFromNormalizedText` and a warning says it must not be used to position
 SpeechForge ships **no** providers. Each one is a separate plugin that calls
 `FSpeechForgeModule::RegisterProvider` at module startup; SpeechForge never learns their names and
 deleting one changes nothing. ElevenLabs lives in
-[SpeechForgeElevenLabs](../SpeechForgeElevenLabs/README.md) - it was a folder inside this plugin
+[SpeechForgeElevenLabs](https://github.com/AutomationForgeHQ/SpeechForgeElevenLabs) - it was a folder inside this plugin
 until 2026-09-01, and extracting it is what removed the last vendor name from the core's defaults.
 With no default provider set, the sole registered provider is used; with several registered,
 generation asks for one to be named rather than guessing, because providers bill different accounts.
@@ -228,7 +228,7 @@ Which model takes inline direction, which one stitches, what a character limit i
 values a model actually accepts - all of it is a provider's private knowledge, asked through
 `GetCaps` and `SupportsStitchingForModel` rather than assumed. The measured ElevenLabs answers,
 including the trade-off that has no correct project-wide default, are in
-[SpeechForgeElevenLabs](../SpeechForgeElevenLabs/README.md).
+[SpeechForgeElevenLabs](https://github.com/AutomationForgeHQ/SpeechForgeElevenLabs).
 
 SpeechForge drops stitching and logs when the model cannot take it, rather than failing the line -
 and because stitching is not part of the content hash, dropping it marks nothing stale.
@@ -363,7 +363,7 @@ ingestion method:
   how many lines are current and re-paid for; recorded, edited and accepted lines are never
   overwritten even by force), **Dub from Source** on a localised bank (the alternative to
   generating a line: carry the source language's performance across instead of re-reading the
-  translated text — see [LOCALIZATION.md](LOCALIZATION.md)), and the **discovered actions**:
+  translated text — see LOCALIZATION.md), and the **discovered actions**:
   any registered toolset function tagged `meta = (SpeechLibraryAction = "Label")` appears in the
   action bar and receives the selection as JSON — installing a plugin adds buttons with no edit
   to SpeechForge, and a third party gets the same seam we use.
@@ -423,8 +423,6 @@ here depends on anything else being present.
 
 ## Related
 
-- **[SpeechForgeToolset](../SpeechForgeToolset/README.md)** — the same pipeline as MCP tools, plus
+- **[SpeechForgeToolset](https://github.com/AutomationForgeHQ/SpeechForgeToolset)** — the same pipeline as MCP tools, plus
   the agent skill. Deleting it changes nothing about how SpeechForge behaves.
-- **[SPEECHFORGE_PLAN.md](../../SPEECHFORGE_PLAN.md)** — the design, the reasoning, and the failure
-  taxonomy written before any of this was built.
-- **[MotionForge](../MotionForge/README.md)** — the same shape, one modality over.
+- **[MotionForge](https://github.com/AutomationForgeHQ/MotionForge)** — the same shape, one modality over.

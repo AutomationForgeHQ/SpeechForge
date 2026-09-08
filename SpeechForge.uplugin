@@ -1,7 +1,7 @@
 {
   "FileVersion": 3,
   "Version": 3,
-  "VersionName": "0.2.0",
+  "VersionName": "0.2.1",
   "FriendlyName": "SpeechForge",
   "Description": "Write a line, generate it with an AI speech provider, and get a USoundWave imported into the project with character-level timing data attached. Owns one pipeline end to end - resolve the voice, price it, synthesize, import, cache. Standalone: no dialogue system, no subtitles, no montages, no gameplay framework. Those belong to adapters built on top.",
   "Category": "Automation Forge",
