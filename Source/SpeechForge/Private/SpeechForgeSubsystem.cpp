@@ -1330,7 +1330,7 @@ TArray<FSpeechSourceDrift> USpeechForgeSubsystem::CheckSourceDrift() const
 	const IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
 
 	TArray<FAssetData> Banks;
-	AssetRegistry.GetAssetsByClass(USpeechBank::StaticClass()->GetClassPathName(), Banks);
+	AssetRegistry.GetAssetsByClass(USpeechBank::StaticClass()->GetClassPathName(), Banks, /*bSearchSubClasses=*/true);
 
 	for (const FAssetData& BankData : Banks)
 	{

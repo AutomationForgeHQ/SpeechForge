@@ -334,6 +334,13 @@ namespace
 
 			if (Column == ColumnOrigin)
 			{
+				// A bank that knows more than the line - a localised one, naming the performance
+				// behind a line and whether this audio is a dub of it - has already said so.
+				if (!Row->OriginLabel.IsEmpty())
+				{
+					return MakeTextCell(FText::FromString(Row->OriginLabel), FText::GetEmpty(), RowSound);
+				}
+
 				// Whose performance, and whose voice - two facts, and on a re-voiced take they have
 				// different answers.
 				FString Value = OriginToString(Status.Origin);
@@ -1171,6 +1178,12 @@ void SSpeechLibraryPanel::RefreshRows()
 					Row->bSourceRecorded =
 						SourceLine->HasAudio() && SourceLine->Origin != ESpeechLineOrigin::Generated;
 				}
+			}
+
+			// The bank's own word on where this line's audio comes from, when it has one.
+			if (const USpeechBank* AsBank = Cast<USpeechBank>(Asset))
+			{
+				AsBank->DescribeLineOrigin(Status, Row->OriginLabel);
 			}
 
 			// The label a human reads: the profile's name. The override's profile when one is set,
@@ -2703,6 +2716,37 @@ FReply SSpeechLibraryPanel::OnGenerateAllClicked()
 	if (!Forge || !ChosenBank.IsValid())
 	{
 		return FReply::Handled();
+	}
+
+	// A bank that produces its own way - a localised one, dubbing the lines with a performance
+	// behind them and generating the rest - runs the whole thing itself, dialog included.
+	if (USpeechBank* Bank = LoadObject<USpeechBank>(nullptr, **ChosenBank))
+	{
+		FSpeechProduceCallbacks Callbacks;
+		Callbacks.Confirm = [](const FText& Question)
+		{
+			return FMessageDialog::Open(EAppMsgType::YesNo, Question) == EAppReturnType::Yes;
+		};
+		TWeakPtr<SSpeechLibraryPanel> WeakSelf = SharedThis(this);
+		Callbacks.OnProgress = [WeakSelf](const FText& Message)
+		{
+			if (const TSharedPtr<SSpeechLibraryPanel> Self = WeakSelf.Pin())
+			{
+				Self->LastMessage = Message;
+			}
+		};
+		Callbacks.OnFinished = [WeakSelf]()
+		{
+			if (const TSharedPtr<SSpeechLibraryPanel> Self = WeakSelf.Pin())
+			{
+				Self->RefreshAll();
+			}
+		};
+		if (Bank->ProduceAll(Callbacks))
+		{
+			RefreshAll();
+			return FReply::Handled();
+		}
 	}
 
 	// The whole bank, no selection required. GenerateLines already skips current, busy and

@@ -108,7 +108,25 @@ public:
 	 */
 	FName ResolveDefaultTranslationProviderId() const;
 
+	// ---------------------------------------------------------------------------------------------
+	// The bank class localisation creates.
+	//
+	// Core knows how to make a sibling bank per language and nothing about what such a bank should
+	// do differently. A localisation add-on that knows more - which of its lines are dubs, how its
+	// faces follow the source performance - registers a USpeechBank subclass here, and every bank
+	// the Localize page creates from then on is one of those. Unregistered, localisation makes plain
+	// banks, exactly as before.
+	// ---------------------------------------------------------------------------------------------
+
+	void RegisterLocalizedBankClass(UClass* BankClass);
+	void UnregisterLocalizedBankClass(UClass* BankClass);
+
+	/** USpeechBank when nothing is registered. */
+	UClass* GetLocalizedBankClass() const;
+
 private:
+
+	TWeakObjectPtr<UClass> LocalizedBankClass;
 
 	FDelegateHandle ToolMenusHandle;
 

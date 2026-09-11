@@ -37,6 +37,13 @@ struct FSpeechLibraryRow
 	 * False on a source-language bank, where there is no source to dub from.
 	 */
 	bool bSourceRecorded = false;
+
+	/**
+	 * What the Origin column shows when the bank has more to say than the line's own origin - a
+	 * localised bank names the source performance behind a line, and whether its audio is a dub.
+	 * Empty means the ordinary text.
+	 */
+	FString OriginLabel;
 };
 
 /** One speaker on the Cast page. AssetPath empty means the id appears in lines but has no sheet yet. */

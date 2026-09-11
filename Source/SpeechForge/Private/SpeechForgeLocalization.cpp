@@ -147,8 +147,15 @@ FString USpeechForgeSubsystem::LocalizeBank(
 			return FString::Printf(TEXT("Could not create package '%s'."), *LocalizedPackage);
 		}
 
+		// The class a localisation add-on registered, when one has: a bank that knows which of its
+		// lines are dubs and how its faces follow the source. Plain USpeechBank otherwise.
+		UClass* BankClass = USpeechBank::StaticClass();
+		if (const FSpeechForgeModule* LiveModule = FSpeechForgeModule::GetPtr())
+		{
+			BankClass = LiveModule->GetLocalizedBankClass();
+		}
 		Localized = NewObject<USpeechBank>(
-			Package, *LocalizedAssetName, RF_Public | RF_Standalone | RF_Transactional);
+			Package, BankClass, *LocalizedAssetName, RF_Public | RF_Standalone | RF_Transactional);
 		FAssetRegistryModule::AssetCreated(Localized);
 	}
 
@@ -297,7 +304,7 @@ TArray<FSpeechLocalizationStatus> USpeechForgeSubsystem::GetLocalizationStatus(c
 		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
 
 	TArray<FAssetData> Banks;
-	Registry.Get().GetAssetsByClass(USpeechBank::StaticClass()->GetClassPathName(), Banks);
+	Registry.Get().GetAssetsByClass(USpeechBank::StaticClass()->GetClassPathName(), Banks, /*bSearchSubClasses=*/true);
 
 	for (const FAssetData& Data : Banks)
 	{
@@ -445,7 +452,11 @@ void USpeechForgeSubsystem::DubLineAudio(
 
 	FSpeechDubbingRequest Request;
 	Request.AbsoluteSourcePath = AbsoluteSource;
-	Request.SourceLanguage = SourceBank->LanguageCode; // Empty: the service detects it.
+	// The authoring bank carries no language; the project setting says what it is. Left empty the
+	// service would guess from five seconds of audio, and a wrong guess dubs fluent nonsense.
+	Request.SourceLanguage = SourceBank->LanguageCode.IsEmpty()
+		? (Settings ? Settings->AuthoringLanguageCode : FString())
+		: SourceBank->LanguageCode;
 	Request.TargetLanguage = LocalizedBank->LanguageCode;
 	Request.AbsoluteOutputPath = Staging /
 		FString::Printf(TEXT("%s_dubbed_%s_%s.mp3"),
@@ -529,8 +540,11 @@ void USpeechForgeSubsystem::DubLineAudio(
 		Line->ProviderRequestId = Result.RequestId;
 		Line->LastError.Reset();
 
-		// No character timings: a dub returns none, and the source's described other words.
+		// No character timings: a dub returns none, and the source's described other words. The
+		// words themselves, as the service transcribed its own dub, are kept when it gave them -
+		// the one way to see what a dub says without listening.
 		Line->Alignment = FSpeechAlignment();
+		Line->Alignment.Text = Result.Alignment.Text;
 		Line->Alignment.DurationSeconds = Imported.ImportedDurationSeconds;
 
 		// Deliberately NOT marked as speaking this line's text. The dub's words are the dubbing
@@ -552,10 +566,13 @@ void USpeechForgeSubsystem::DubLineAudio(
 		SpeechLocalizationPrivate::SaveAsset(LocalizedBank);
 
 		const FString Message = FString::Printf(
-			TEXT("'%s' dubbed into '%s': %s (%.2fs). Listen once - the dub's wording is the ")
+			TEXT("'%s' dubbed into '%s': %s (%.2fs).%s Listen once - the dub's wording is the ")
 			TEXT("service's own translation, not necessarily the subtitle's."),
 			*LocalizedHandle.LineId.ToString(), *TargetLanguage,
-			*Imported.Sound.ToString(), Imported.ImportedDurationSeconds);
+			*Imported.Sound.ToString(), Imported.ImportedDurationSeconds,
+			Result.Alignment.Text.IsEmpty()
+				? TEXT("")
+				: *FString::Printf(TEXT(" It says: \"%s\"."), *Result.Alignment.Text));
 
 		UE_LOG(LogSpeechForge, Log, TEXT("%s"), *Message);
 		OnComplete(true, Message);

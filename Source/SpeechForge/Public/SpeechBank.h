@@ -8,6 +8,22 @@
 #include "SpeechSources.h"
 #include "SpeechBank.generated.h"
 
+struct FSpeechLineStatus;
+
+/**
+ * What a bank is handed when asked to produce all of its lines - see USpeechBank::ProduceAll.
+ *
+ * Confirm is the panel's dialog (or a test's automatic yes): the bank composes the question, with
+ * whatever it knows about cost, and the surface asks it. Progress lines are what a status bar shows
+ * while it runs; Finished is raised once, when nothing is in flight any more.
+ */
+struct FSpeechProduceCallbacks
+{
+	TFunction<bool(const FText& /*Question*/)> Confirm;
+	TFunction<void(const FText& /*Message*/)> OnProgress;
+	TFunction<void()> OnFinished;
+};
+
 /**
  * A set of speech lines - a scene, a character's barks, a quest's dialogue.
  *
@@ -24,6 +40,27 @@ class SPEECHFORGE_API USpeechBank : public UDataAsset, public ISpeechLineSource
 	GENERATED_BODY()
 
 public:
+
+	// ---------------------------------------------------------------------------------------------
+	// Seams for banks that know more than this one.
+	//
+	// A localised bank is the case these exist for: some of its lines should be dubbed from a
+	// performance rather than read out again, and it can say so per line. Core keeps the surface;
+	// the subclass keeps the knowledge. Both default to "nothing special", so a plain bank behaves
+	// exactly as it always has.
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * Produce every line that needs it, the bank's own way. Return true when handled - the surface
+	 * then does nothing else - or false to get the ordinary generate-what-is-missing behaviour.
+	 */
+	virtual bool ProduceAll(const FSpeechProduceCallbacks& Callbacks) { return false; }
+
+	/**
+	 * A label for the Origin column that says more than the line's own origin, when there is more
+	 * to say. Return true with the label set, or false for the ordinary text.
+	 */
+	virtual bool DescribeLineOrigin(const FSpeechLineStatus& Status, FString& OutLabel) const { return false; }
 
 	/** What this bank is for, for whoever finds it later. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Bank", meta = (MultiLine = true))

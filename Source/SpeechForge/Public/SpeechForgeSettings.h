@@ -110,6 +110,17 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Pipeline")
 	FString OutputContentPath = TEXT("/Game/_Generated/Speech");
 
+	/**
+	 * The language the authoring banks are written and recorded in, as a code ("en", "pt-BR").
+	 *
+	 * An authoring bank carries no language of its own - only its localised siblings do - and a
+	 * dub needs to be told what it is translating FROM. Left to the service, detection on a
+	 * five-second line guesses, and a wrong guess comes back as fluent nonsense. Stated here once,
+	 * it is right for every line.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Localisation")
+	FString AuthoringLanguageCode = TEXT("en");
+
 	// Sorted by kind, at the point of generation.
 	//
 	// A tool that writes every asset it makes into one folder produces something nobody can read

@@ -7,6 +7,7 @@
 #include "ISpeechTranslationProvider.h"
 #include "PseudoTranslationProvider.h"
 #include "SpeechSources.h"
+#include "SpeechBank.h"
 #include "SpeechCredentialStore.h"
 #include "SpeechForgeEditorSettings.h"
 #include "SpeechForgeSettings.h"
@@ -383,6 +384,40 @@ void FSpeechForgeModule::RegisterTranslationProvider(TSharedRef<ISpeechTranslati
 #endif
 
 	OnProvidersChanged.Broadcast();
+}
+
+void FSpeechForgeModule::RegisterLocalizedBankClass(UClass* BankClass)
+{
+	if (!BankClass || !BankClass->IsChildOf(USpeechBank::StaticClass()))
+	{
+		UE_LOG(LogSpeechForge, Error,
+			TEXT("A localised bank class must derive from USpeechBank; '%s' does not. Ignored."),
+			BankClass ? *BankClass->GetName() : TEXT("null"));
+		return;
+	}
+
+	if (LocalizedBankClass.IsValid() && LocalizedBankClass.Get() != BankClass)
+	{
+		UE_LOG(LogSpeechForge, Warning,
+			TEXT("Localised bank class '%s' replaces '%s'. Two add-ons are competing for the same seat."),
+			*BankClass->GetName(), *LocalizedBankClass->GetName());
+	}
+
+	LocalizedBankClass = BankClass;
+	UE_LOG(LogSpeechForge, Log, TEXT("Localised banks are created as '%s'."), *BankClass->GetName());
+}
+
+void FSpeechForgeModule::UnregisterLocalizedBankClass(UClass* BankClass)
+{
+	if (LocalizedBankClass.Get() == BankClass)
+	{
+		LocalizedBankClass.Reset();
+	}
+}
+
+UClass* FSpeechForgeModule::GetLocalizedBankClass() const
+{
+	return LocalizedBankClass.IsValid() ? LocalizedBankClass.Get() : USpeechBank::StaticClass();
 }
 
 void FSpeechForgeModule::UnregisterTranslationProvider(FName ProviderId)
